@@ -67,7 +67,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         val dao = AppDatabase.getDatabase(application).auraDao()
-        repository = AuraRepository(dao)
+        repository = AuraRepository(dao, application)
 
         val savedUser = sessionManager.getSessionUsername()
         if (!savedUser.isNullOrBlank()) {
@@ -580,8 +580,13 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // NAVIGATION & UI HELPERS
+    fun refreshFeed() {
+        repository.refreshAllData()
+    }
+
     fun navigateTo(screen: AuraScreen) {
         _currentScreen.value = screen
+        refreshFeed()
     }
 
     fun switchAuthState(state: AuthState) {

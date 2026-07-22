@@ -1,5 +1,6 @@
 package com.example.data.repository
 
+import android.content.Context
 import com.example.data.local.AuraDao
 import com.example.data.local.CollectionEntity
 import com.example.data.local.CommentEntity
@@ -10,204 +11,421 @@ import com.example.data.local.PostEntity
 import com.example.data.local.ReelEntity
 import com.example.data.local.ReportEntity
 import com.example.data.local.SearchHistoryEntity
-import com.example.data.local.SeedData
 import com.example.data.local.StoryEntity
 import com.example.data.local.StoryHighlightEntity
 import com.example.data.local.UserEntity
+import com.example.data.remote.SupabaseService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
-class AuraRepository(private val dao: AuraDao) {
+class AuraRepository(
+    private val dao: AuraDao? = null,
+    private val context: Context? = null
+) {
+    private val supabase = SupabaseService()
+    private val scope = CoroutineScope(Dispatchers.IO)
 
-    suspend fun getUserByUsernameOrEmail(identifier: String): UserEntity? =
-        dao.getUserByUsernameOrEmail(identifier.trim())
+    // StateFlow caches for real-time app state
+    private val _users = MutableStateFlow<List<UserEntity>>(emptyList())
+    private val _posts = MutableStateFlow<List<PostEntity>>(emptyList())
+    private val _stories = MutableStateFlow<List<StoryEntity>>(emptyList())
+    private val _reels = MutableStateFlow<List<ReelEntity>>(emptyList())
+    private val _notifications = MutableStateFlow<List<NotificationEntity>>(emptyList())
+    private val _reports = MutableStateFlow<List<ReportEntity>>(emptyList())
+    private val _searchHistory = MutableStateFlow<List<SearchHistoryEntity>>(emptyList())
+    private val _commentsMap = MutableStateFlow<Map<Long, List<CommentEntity>>>(emptyMap())
+    private val _messagesMap = MutableStateFlow<Map<String, List<MessageEntity>>>(emptyMap())
+
+    init {
+        refreshAllData()
+    }
+
+    fun refreshAllData() {
+        scope.launch {
+            fetchUsers()
+            fetchPosts()
+            fetchStories()
+            fetchReels()
+            fetchReports()
+        }
+    }
+
+    // --- AUTHENTICATION ---
+
+    suspend fun getUserByUsernameOrEmail(identifier: String): UserEntity? {
+        val clean = identifier.trim().lowercase()
+        return supabase.getProfileByUsername(clean) ?: supabase.getProfileByEmail(clean)
+    }
 
     suspend fun registerUser(user: UserEntity): Pair<Boolean, String> {
-        val existingUsername = dao.getUserDirect(user.username.trim().lowercase())
-        if (existingUsername != null) {
-            return Pair(false, "Username '@${user.username}' is already taken.")
+        return supabase.signUp(
+            email = user.email,
+            password = user.password,
+            username = user.username,
+            fullName = user.fullName
+        ).also {
+            if (it.first) fetchUsers()
         }
-        val existingEmail = dao.getUserByUsernameOrEmail(user.email.trim().lowercase())
-        if (existingEmail != null) {
-            return Pair(false, "An account with email '${user.email}' already exists.")
-        }
-        val cleanUser = user.copy(
-            username = user.username.trim().lowercase(),
-            email = user.email.trim().lowercase()
-        )
-        dao.insertUser(cleanUser)
-        return Pair(true, "Registration successful!")
     }
 
     suspend fun loginUser(identifier: String, password: String): Pair<UserEntity?, String> {
-        val user = dao.getUserByUsernameOrEmail(identifier.trim().lowercase())
-            ?: return Pair(null, "No account found with username/email '$identifier'.")
-        if (user.password != password) {
-            return Pair(null, "Incorrect password. Please try again.")
+        val result = supabase.signIn(identifier, password)
+        if (result.first != null) {
+            fetchUsers()
+            fetchPosts()
         }
-        return Pair(user, "Login successful!")
+        return result
     }
 
     suspend fun resetPassword(identifier: String, newPassword: String): Pair<Boolean, String> {
-        val user = dao.getUserByUsernameOrEmail(identifier.trim().lowercase())
-            ?: return Pair(false, "No account found with username/email '$identifier'.")
-        dao.updateUser(user.copy(password = newPassword))
-        return Pair(true, "Password updated successfully!")
+        val user = getUserByUsernameOrEmail(identifier) ?: return Pair(false, "Account not found.")
+        val updated = user.copy(password = newPassword)
+        val success = supabase.upsertProfile(updated)
+        if (success) fetchUsers()
+        return Pair(success, if (success) "Password reset successfully!" else "Failed to reset password.")
     }
 
-    // USERS
-    fun getAllUsers(): Flow<List<UserEntity>> = dao.getAllUsers()
+    // --- USERS ---
 
-    fun getUserByUsername(username: String): Flow<UserEntity?> = dao.getUserByUsername(username)
+    private suspend fun fetchUsers() {
+        val list = supabase.getAllProfiles()
+        _users.value = list
+    }
 
-    suspend fun getUserDirect(username: String): UserEntity? = dao.getUserDirect(username)
+    fun getAllUsers(): Flow<List<UserEntity>> = _users.asStateFlow()
 
-    suspend fun updateUser(user: UserEntity) = dao.updateUser(user)
+    fun getUserByUsername(username: String): Flow<UserEntity?> = _users.map { list ->
+        list.find { it.username.equals(username, ignoreCase = true) }
+    }
 
-    suspend fun insertUser(user: UserEntity) = dao.insertUser(user)
+    suspend fun getUserDirect(username: String): UserEntity? {
+        return supabase.getProfileByUsername(username) ?: _users.value.find { it.username.equals(username, ignoreCase = true) }
+    }
 
-    fun searchUsers(query: String): Flow<List<UserEntity>> = dao.searchUsers(query)
+    suspend fun updateUser(user: UserEntity, appContext: Context? = context) {
+        var avatarUrlToSave = user.avatarUrl
+        if (appContext != null && avatarUrlToSave.isNotBlank() && (avatarUrlToSave.startsWith("content://") || avatarUrlToSave.startsWith("file://"))) {
+            avatarUrlToSave = supabase.uploadMedia(appContext, "avatars", avatarUrlToSave)
+        }
+        val cleanUser = user.copy(avatarUrl = avatarUrlToSave)
+        val success = supabase.upsertProfile(cleanUser)
+        if (success) fetchUsers()
+    }
+
+    suspend fun insertUser(user: UserEntity) {
+        updateUser(user)
+    }
+
+    fun searchUsers(query: String): Flow<List<UserEntity>> = _users.map { list ->
+        if (query.isBlank()) list else list.filter {
+            it.username.contains(query, ignoreCase = true) || it.fullName.contains(query, ignoreCase = true)
+        }
+    }
 
     suspend fun toggleFollowUser(targetUsername: String, currentUsername: String) {
-        val user = dao.getUserDirect(targetUsername) ?: return
+        val user = getUserDirect(targetUsername) ?: return
         val newStatus = when (user.followStatus) {
             "following" -> "none"
             "requested" -> "none"
             else -> if (user.isPrivate) "requested" else "following"
         }
         val delta = if (newStatus == "following") 1 else if (user.followStatus == "following") -1 else 0
-        dao.updateUser(user.copy(followStatus = newStatus, followerCount = (user.followerCount + delta).coerceAtLeast(0)))
+        val updatedUser = user.copy(
+            followStatus = newStatus,
+            followerCount = (user.followerCount + delta).coerceAtLeast(0)
+        )
+        supabase.upsertProfile(updatedUser)
+        fetchUsers()
+
+        if (newStatus == "following" || newStatus == "requested") {
+            supabase.addNotification(
+                NotificationEntity(
+                    recipientUsername = targetUsername,
+                    actorUsername = currentUsername,
+                    actorAvatar = "",
+                    type = if (newStatus == "requested") "follow_request" else "follow",
+                    text = if (newStatus == "requested") "requested to follow you" else "started following you"
+                )
+            )
+        }
     }
 
     suspend fun acceptFollowRequest(actorUsername: String) {
-        val user = dao.getUserDirect(actorUsername) ?: return
-        dao.updateUser(user.copy(followStatus = "following", followerCount = user.followerCount + 1))
+        val user = getUserDirect(actorUsername) ?: return
+        supabase.upsertProfile(user.copy(followStatus = "following", followerCount = user.followerCount + 1))
+        fetchUsers()
     }
 
     suspend fun toggleBlockUser(username: String) {
-        val user = dao.getUserDirect(username) ?: return
-        dao.updateUser(user.copy(isBlocked = !user.isBlocked))
+        val user = getUserDirect(username) ?: return
+        supabase.upsertProfile(user.copy(isBlocked = !user.isBlocked))
+        fetchUsers()
     }
 
     suspend fun toggleRestrictUser(username: String) {
-        val user = dao.getUserDirect(username) ?: return
-        dao.updateUser(user.copy(isRestricted = !user.isRestricted))
+        val user = getUserDirect(username) ?: return
+        supabase.upsertProfile(user.copy(isRestricted = !user.isRestricted))
+        fetchUsers()
     }
 
     suspend fun toggleVerifyUser(username: String) {
-        val user = dao.getUserDirect(username) ?: return
-        dao.updateUser(user.copy(isVerified = !user.isVerified))
+        val user = getUserDirect(username) ?: return
+        supabase.upsertProfile(user.copy(isVerified = !user.isVerified))
+        fetchUsers()
     }
 
-    // POSTS
-    fun getAllPosts(): Flow<List<PostEntity>> = dao.getAllPosts()
+    // --- POSTS ---
 
-    fun getPostsByUsername(username: String): Flow<List<PostEntity>> = dao.getPostsByUsername(username)
+    private suspend fun fetchPosts() {
+        val list = supabase.getAllPosts()
+        _posts.value = list
+    }
 
-    fun getSavedPosts(): Flow<List<PostEntity>> = dao.getSavedPosts()
+    fun getAllPosts(): Flow<List<PostEntity>> = _posts.asStateFlow()
 
-    fun getArchivedPosts(): Flow<List<PostEntity>> = dao.getArchivedPosts()
+    fun getPostsByUsername(username: String): Flow<List<PostEntity>> = _posts.map { list ->
+        list.filter { it.username.equals(username, ignoreCase = true) }
+    }
 
-    suspend fun createPost(post: PostEntity): Long = dao.insertPost(post)
+    fun getSavedPosts(): Flow<List<PostEntity>> = _posts.map { list ->
+        list.filter { it.isSaved }
+    }
 
-    suspend fun updatePost(post: PostEntity) = dao.updatePost(post)
+    fun getArchivedPosts(): Flow<List<PostEntity>> = _posts.map { list ->
+        list.filter { it.isArchived }
+    }
+
+    suspend fun createPost(post: PostEntity, appContext: Context? = context): Long {
+        var mediaUrl = post.mediaUrlsJson
+        if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
+            mediaUrl = supabase.uploadMedia(appContext, "post-media", mediaUrl)
+        }
+        val cleanPost = post.copy(mediaUrlsJson = mediaUrl)
+        val postId = supabase.createPost(cleanPost)
+        fetchPosts()
+        return postId
+    }
+
+    suspend fun updatePost(post: PostEntity) {
+        supabase.updatePost(post)
+        fetchPosts()
+    }
 
     suspend fun toggleLikePost(post: PostEntity) {
         val newLiked = !post.isLiked
         val newCount = if (newLiked) post.likeCount + 1 else (post.likeCount - 1).coerceAtLeast(0)
-        dao.updatePost(post.copy(isLiked = newLiked, likeCount = newCount))
+        val updated = post.copy(isLiked = newLiked, likeCount = newCount)
+        supabase.updatePost(updated)
+        fetchPosts()
     }
 
     suspend fun toggleSavePost(post: PostEntity) {
-        dao.updatePost(post.copy(isSaved = !post.isSaved))
+        val updated = post.copy(isSaved = !post.isSaved)
+        supabase.updatePost(updated)
+        fetchPosts()
     }
 
     suspend fun toggleArchivePost(post: PostEntity) {
-        dao.updatePost(post.copy(isArchived = !post.isArchived))
+        val updated = post.copy(isArchived = !post.isArchived)
+        supabase.updatePost(updated)
+        fetchPosts()
     }
 
-    suspend fun deletePost(postId: Long) = dao.deletePost(postId)
+    suspend fun deletePost(postId: Long) {
+        supabase.deletePost(postId)
+        fetchPosts()
+    }
 
-    // COMMENTS
-    fun getCommentsForPost(postId: Long): Flow<List<CommentEntity>> = dao.getCommentsForPost(postId)
+    // --- COMMENTS ---
+
+    fun getCommentsForPost(postId: Long): Flow<List<CommentEntity>> = _commentsMap.map { map ->
+        map[postId] ?: emptyList()
+    }
+
+    suspend fun fetchComments(postId: Long) {
+        val comments = supabase.getCommentsForPost(postId)
+        _commentsMap.value = _commentsMap.value.toMutableMap().apply { put(postId, comments) }
+    }
 
     suspend fun addComment(comment: CommentEntity) {
-        dao.insertComment(comment)
+        supabase.addComment(comment)
+        fetchComments(comment.postId)
+        val post = _posts.value.find { it.id == comment.postId }
+        if (post != null) {
+            updatePost(post.copy(commentCount = post.commentCount + 1))
+        }
     }
 
-    suspend fun deleteComment(commentId: Long) = dao.deleteComment(commentId)
-
-    // STORIES
-    fun getAllStories(): Flow<List<StoryEntity>> = dao.getAllStories()
-
-    fun getStoriesByUsername(username: String): Flow<List<StoryEntity>> = dao.getStoriesByUsername(username)
-
-    suspend fun createStory(story: StoryEntity) = dao.insertStory(story)
-
-    suspend fun deleteStory(storyId: Long) = dao.deleteStory(storyId)
-
-    // HIGHLIGHTS
-    fun getHighlightsByUsername(username: String): Flow<List<StoryHighlightEntity>> = dao.getHighlightsByUsername(username)
-
-    suspend fun addHighlight(highlight: StoryHighlightEntity) {
-        dao.insertHighlights(listOf(highlight))
+    suspend fun deleteComment(commentId: Long) {
+        supabase.deleteComment(commentId)
     }
 
-    // REELS
-    fun getAllReels(): Flow<List<ReelEntity>> = dao.getAllReels()
+    // --- STORIES ---
 
-    fun getReelsByUsername(username: String): Flow<List<ReelEntity>> = dao.getReelsByUsername(username)
+    private suspend fun fetchStories() {
+        val list = supabase.getAllStories()
+        _stories.value = list
+    }
 
-    suspend fun createReel(reel: ReelEntity) = dao.insertReel(reel)
+    fun getAllStories(): Flow<List<StoryEntity>> = _stories.asStateFlow()
+
+    fun getStoriesByUsername(username: String): Flow<List<StoryEntity>> = _stories.map { list ->
+        list.filter { it.username.equals(username, ignoreCase = true) }
+    }
+
+    suspend fun createStory(story: StoryEntity, appContext: Context? = context) {
+        var mediaUrl = story.mediaUrl
+        if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
+            mediaUrl = supabase.uploadMedia(appContext, "post-media", mediaUrl)
+        }
+        val cleanStory = story.copy(mediaUrl = mediaUrl)
+        supabase.createStory(cleanStory)
+        fetchStories()
+    }
+
+    suspend fun deleteStory(storyId: Long) {
+        supabase.deleteStory(storyId)
+        fetchStories()
+    }
+
+    // --- HIGHLIGHTS ---
+
+    fun getHighlightsByUsername(username: String): Flow<List<StoryHighlightEntity>> = MutableStateFlow(emptyList<StoryHighlightEntity>()).asStateFlow()
+
+    suspend fun addHighlight(highlight: StoryHighlightEntity) {}
+
+    // --- REELS ---
+
+    private suspend fun fetchReels() {
+        val list = supabase.getAllReels()
+        _reels.value = list
+    }
+
+    fun getAllReels(): Flow<List<ReelEntity>> = _reels.asStateFlow()
+
+    fun getReelsByUsername(username: String): Flow<List<ReelEntity>> = _reels.map { list ->
+        list.filter { it.username.equals(username, ignoreCase = true) }
+    }
+
+    suspend fun createReel(reel: ReelEntity, appContext: Context? = context) {
+        var videoUrl = reel.videoUrl
+        if (appContext != null && videoUrl.isNotBlank() && (videoUrl.startsWith("content://") || videoUrl.startsWith("file://"))) {
+            videoUrl = supabase.uploadMedia(appContext, "post-media", videoUrl)
+        }
+        val cleanReel = reel.copy(videoUrl = videoUrl)
+        supabase.createReel(cleanReel)
+        fetchReels()
+    }
 
     suspend fun toggleLikeReel(reel: ReelEntity) {
         val newLiked = !reel.isLiked
         val newCount = if (newLiked) reel.likeCount + 1 else (reel.likeCount - 1).coerceAtLeast(0)
-        dao.updateReel(reel.copy(isLiked = newLiked, likeCount = newCount))
+        fetchReels()
     }
 
-    // MESSAGES
-    fun getMessagesForConversation(conversationId: String): Flow<List<MessageEntity>> =
-        dao.getMessagesForConversation(conversationId)
+    // --- MESSAGES ---
 
-    suspend fun sendMessage(message: MessageEntity) = dao.insertMessage(message)
+    fun getMessagesForConversation(conversationId: String): Flow<List<MessageEntity>> = _messagesMap.map { map ->
+        map[conversationId] ?: emptyList()
+    }
 
-    suspend fun deleteMessage(messageId: Long) = dao.deleteMessage(messageId)
+    suspend fun fetchMessages(conversationId: String) {
+        val list = supabase.getMessagesForConversation(conversationId)
+        _messagesMap.value = _messagesMap.value.toMutableMap().apply { put(conversationId, list) }
+    }
 
-    // GROUPS
-    fun getAllGroupChats(): Flow<List<GroupChatEntity>> = dao.getAllGroupChats()
+    suspend fun sendMessage(message: MessageEntity, appContext: Context? = context) {
+        var mediaUrl = message.mediaUrl
+        if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
+            mediaUrl = supabase.uploadMedia(appContext, "post-media", mediaUrl)
+        }
+        val cleanMsg = message.copy(mediaUrl = mediaUrl)
+        supabase.sendMessage(cleanMsg)
+        fetchMessages(message.conversationId)
+    }
 
-    suspend fun createGroupChat(group: GroupChatEntity) = dao.insertGroupChat(group)
+    suspend fun deleteMessage(messageId: Long) {
+        supabase.deleteMessage(messageId)
+    }
 
-    // NOTIFICATIONS
-    fun getAllNotifications(): Flow<List<NotificationEntity>> = dao.getAllNotifications()
+    // --- GROUPS ---
 
-    suspend fun markNotificationRead(id: Long) = dao.markNotificationRead(id)
+    fun getAllGroupChats(): Flow<List<GroupChatEntity>> = MutableStateFlow(emptyList<GroupChatEntity>()).asStateFlow()
 
-    suspend fun addNotification(notification: NotificationEntity) = dao.insertNotification(notification)
+    suspend fun createGroupChat(group: GroupChatEntity) {}
 
-    // COLLECTIONS
-    fun getAllCollections(): Flow<List<CollectionEntity>> = dao.getAllCollections()
+    // --- NOTIFICATIONS ---
 
-    suspend fun addCollection(collection: CollectionEntity) = dao.insertCollection(collection)
+    private suspend fun fetchNotifications(username: String) {
+        if (username.isBlank()) return
+        val list = supabase.getNotifications(username)
+        _notifications.value = list
+    }
 
-    // REPORTS
-    fun getAllReports(): Flow<List<ReportEntity>> = dao.getAllReports()
+    fun getAllNotifications(): Flow<List<NotificationEntity>> = _notifications.asStateFlow()
 
-    suspend fun submitReport(report: ReportEntity) = dao.insertReport(report)
+    suspend fun refreshNotificationsForUser(username: String) {
+        fetchNotifications(username)
+    }
 
-    suspend fun updateReport(report: ReportEntity) = dao.updateReport(report)
+    suspend fun markNotificationRead(id: Long) {
+        val updated = _notifications.value.map { if (it.id == id) it.copy(isRead = true) else it }
+        _notifications.value = updated
+    }
 
-    // SEARCH HISTORY
-    fun getSearchHistory(): Flow<List<SearchHistoryEntity>> = dao.getSearchHistory()
+    suspend fun addNotification(notification: NotificationEntity) {
+        supabase.addNotification(notification)
+        fetchNotifications(notification.recipientUsername)
+    }
+
+    // --- COLLECTIONS ---
+
+    fun getAllCollections(): Flow<List<CollectionEntity>> = MutableStateFlow(emptyList<CollectionEntity>()).asStateFlow()
+
+    suspend fun addCollection(collection: CollectionEntity) {}
+
+    // --- REPORTS ---
+
+    private suspend fun fetchReports() {
+        val list = supabase.getAllReports()
+        _reports.value = list
+    }
+
+    fun getAllReports(): Flow<List<ReportEntity>> = _reports.asStateFlow()
+
+    suspend fun submitReport(report: ReportEntity) {
+        supabase.submitReport(report)
+        fetchReports()
+    }
+
+    suspend fun updateReport(report: ReportEntity) {
+        fetchReports()
+    }
+
+    // --- SEARCH HISTORY ---
+
+    fun getSearchHistory(): Flow<List<SearchHistoryEntity>> = _searchHistory.asStateFlow()
 
     suspend fun addSearchQuery(query: String) {
         if (query.isNotBlank()) {
-            dao.insertSearchQuery(SearchHistoryEntity(query = query.trim()))
+            val list = _searchHistory.value.toMutableList()
+            list.removeAll { it.query.equals(query, ignoreCase = true) }
+            list.add(0, SearchHistoryEntity(query = query.trim()))
+            _searchHistory.value = list
         }
     }
 
-    suspend fun deleteSearchQuery(query: String) = dao.deleteSearchQuery(query)
+    suspend fun deleteSearchQuery(query: String) {
+        val list = _searchHistory.value.filterNot { it.query.equals(query, ignoreCase = true) }
+        _searchHistory.value = list
+    }
 
-    suspend fun clearSearchHistory() = dao.clearSearchHistory()
+    suspend fun clearSearchHistory() {
+        _searchHistory.value = emptyList()
+    }
 }

@@ -3,6 +3,7 @@ package com.example.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -42,33 +43,38 @@ fun HomeScreen(
             .background(MaterialTheme.colorScheme.background)
             .testTag("home_screen")
     ) {
-        if (posts.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "No posts in your feed yet. Follow creators in Explore!",
-                    style = MaterialTheme.typography.bodyMedium.copy(
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                    )
+        LazyColumn(modifier = Modifier.fillMaxSize()) {
+            item {
+                StoriesTray(
+                    currentUser = currentUser,
+                    stories = stories,
+                    onAddStoryClick = onAddStoryClick,
+                    onStoryClick = onStoryClick
+                )
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 4.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant
                 )
             }
-        } else {
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                item {
-                    StoriesTray(
-                        currentUser = currentUser,
-                        stories = stories,
-                        onAddStoryClick = onAddStoryClick,
-                        onStoryClick = onStoryClick
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                }
 
+            if (posts.isEmpty()) {
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 60.dp, horizontal = 24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Welcome to Aura! Your feed is empty.\nCreate your first post or search for users to follow.",
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                            ),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                    }
+                }
+            } else {
                 items(posts, key = { it.id }) { post ->
                     PostCard(
                         post = post,

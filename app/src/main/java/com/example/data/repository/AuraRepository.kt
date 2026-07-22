@@ -19,19 +19,40 @@ import kotlinx.coroutines.flow.firstOrNull
 
 class AuraRepository(private val dao: AuraDao) {
 
-    suspend fun checkAndSeedInitialData() {
-        val existingUsers = dao.getAllUsers().firstOrNull()
-        if (existingUsers.isNullOrEmpty()) {
-            dao.insertUsers(SeedData.initialUsers)
-            dao.insertPosts(SeedData.initialPosts)
-            dao.insertStories(SeedData.initialStories)
-            dao.insertReels(SeedData.initialReels)
-            dao.insertMessages(SeedData.initialMessages)
-            dao.insertNotifications(SeedData.initialNotifications)
-            for (col in SeedData.initialCollections) {
-                dao.insertCollection(col)
-            }
+    suspend fun getUserByUsernameOrEmail(identifier: String): UserEntity? =
+        dao.getUserByUsernameOrEmail(identifier.trim())
+
+    suspend fun registerUser(user: UserEntity): Pair<Boolean, String> {
+        val existingUsername = dao.getUserDirect(user.username.trim().lowercase())
+        if (existingUsername != null) {
+            return Pair(false, "Username '@${user.username}' is already taken.")
         }
+        val existingEmail = dao.getUserByUsernameOrEmail(user.email.trim().lowercase())
+        if (existingEmail != null) {
+            return Pair(false, "An account with email '${user.email}' already exists.")
+        }
+        val cleanUser = user.copy(
+            username = user.username.trim().lowercase(),
+            email = user.email.trim().lowercase()
+        )
+        dao.insertUser(cleanUser)
+        return Pair(true, "Registration successful!")
+    }
+
+    suspend fun loginUser(identifier: String, password: String): Pair<UserEntity?, String> {
+        val user = dao.getUserByUsernameOrEmail(identifier.trim().lowercase())
+            ?: return Pair(null, "No account found with username/email '$identifier'.")
+        if (user.password != password) {
+            return Pair(null, "Incorrect password. Please try again.")
+        }
+        return Pair(user, "Login successful!")
+    }
+
+    suspend fun resetPassword(identifier: String, newPassword: String): Pair<Boolean, String> {
+        val user = dao.getUserByUsernameOrEmail(identifier.trim().lowercase())
+            ?: return Pair(false, "No account found with username/email '$identifier'.")
+        dao.updateUser(user.copy(password = newPassword))
+        return Pair(true, "Password updated successfully!")
     }
 
     // USERS

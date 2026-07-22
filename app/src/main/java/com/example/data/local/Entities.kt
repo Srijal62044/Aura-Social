@@ -8,6 +8,7 @@ data class UserEntity(
     @PrimaryKey val username: String,
     val fullName: String,
     val email: String,
+    val password: String = "",
     val bio: String = "",
     val website: String = "",
     val avatarUrl: String = "",
@@ -68,7 +69,7 @@ data class StoryEntity(
     val timestamp: String = "1h ago",
     val isCloseFriends: Boolean = false,
     val isViewed: Boolean = false,
-    val viewerCount: Int = 12
+    val viewerCount: Int = 0
 )
 
 @Entity(tableName = "story_highlights")
@@ -103,12 +104,13 @@ data class MessageEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val conversationId: String, // username or groupId
     val senderUsername: String,
+    val recipientUsername: String = "",
     val senderAvatar: String,
     val text: String = "",
     val mediaUrl: String = "",
     val type: String = "text", // "text", "image", "voice", "post_share"
     val timestamp: String = "Just now",
-    val isRead: Boolean = true,
+    val isRead: Boolean = false,
     val isMine: Boolean = true,
     val reaction: String = ""
 )
@@ -127,12 +129,13 @@ data class GroupChatEntity(
 @Entity(tableName = "notifications")
 data class NotificationEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val recipientUsername: String = "",
     val actorUsername: String,
     val actorAvatar: String,
     val type: String, // "follow", "follow_request", "like", "comment", "mention", "story_reaction"
     val targetId: Long = 0,
     val text: String,
-    val timestamp: String = "10m ago",
+    val timestamp: String = "Just now",
     val isRead: Boolean = false
 )
 

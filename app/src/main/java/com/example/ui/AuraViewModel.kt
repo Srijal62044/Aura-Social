@@ -12,15 +12,19 @@ import com.example.data.local.NotificationEntity
 import com.example.data.local.PostEntity
 import com.example.data.local.ReelEntity
 import com.example.data.local.ReportEntity
+import com.example.data.local.SessionManager
 import com.example.data.local.StoryEntity
 import com.example.data.local.StoryHighlightEntity
 import com.example.data.local.UserEntity
 import com.example.data.repository.AuraRepository
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -43,36 +47,48 @@ data class CallState(
     val isCameraOn: Boolean = true
 )
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: AuraRepository
+    private val sessionManager = SessionManager(application)
+
+    // AUTH STATE
+    private val _authState = MutableStateFlow(AuthState.LOGIN)
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
+
+    private val _authError = MutableStateFlow<String?>(null)
+    val authError: StateFlow<String?> = _authError.asStateFlow()
+
+    private val _authLoading = MutableStateFlow(false)
+    val authLoading: StateFlow<Boolean> = _authLoading.asStateFlow()
+
+    private val _currentUsername = MutableStateFlow("")
+    val currentUsername: StateFlow<String> = _currentUsername.asStateFlow()
 
     init {
         val dao = AppDatabase.getDatabase(application).auraDao()
         repository = AuraRepository(dao)
-        viewModelScope.launch {
-            repository.checkAndSeedInitialData()
+
+        val savedUser = sessionManager.getSessionUsername()
+        if (!savedUser.isNullOrBlank()) {
+            viewModelScope.launch {
+                val dbUser = repository.getUserDirect(savedUser)
+                if (dbUser != null) {
+                    _currentUsername.value = dbUser.username
+                    _authState.value = AuthState.LOGGED_IN
+                } else {
+                    sessionManager.clearSession()
+                    _authState.value = AuthState.LOGIN
+                }
+            }
+        } else {
+            _authState.value = AuthState.LOGIN
         }
     }
 
-    // AUTH STATE
-    private val _authState = MutableStateFlow(AuthState.LOGGED_IN)
-    val authState: StateFlow<AuthState> = _authState.asStateFlow()
-
-    private val _currentUsername = MutableStateFlow("my_username")
-    val currentUsername: StateFlow<String> = _currentUsername.asStateFlow()
-
-    val currentUser: StateFlow<UserEntity?> = repository.getUserByUsername("my_username")
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserEntity(
-            username = "my_username",
-            fullName = "Aura Creator",
-            email = "creator@aura.app",
-            bio = "Exploring art, tech & stories on Aura 🌟",
-            website = "https://aura.app/my_username",
-            avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
-            followerCount = 1250,
-            followingCount = 420,
-            postCount = 12
-        ))
+    val currentUser: StateFlow<UserEntity?> = combine(_currentUsername, repository.getAllUsers()) { username, users ->
+        users.find { it.username == username }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     // THEME & NAVIGATION
     private val _isDarkTheme = MutableStateFlow(true)
@@ -104,8 +120,12 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val allUsers: StateFlow<List<UserEntity>> = repository.getAllUsers()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val allNotifications: StateFlow<List<NotificationEntity>> = repository.getAllNotifications()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val allNotifications: StateFlow<List<NotificationEntity>> = combine(
+        repository.getAllNotifications(),
+        _currentUsername
+    ) { notifications, username ->
+        notifications.filter { it.recipientUsername.isBlank() || it.recipientUsername == username }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val allCollections: StateFlow<List<CollectionEntity>> = repository.getAllCollections()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -127,6 +147,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val selectedUserProfile: StateFlow<UserEntity?> = _selectedUserProfile.asStateFlow()
 
     fun selectUserProfile(username: String) {
+        if (username == _currentUsername.value) {
+            _currentScreen.value = AuraScreen.PROFILE
+            return
+        }
         _selectedUsername.value = username
         viewModelScope.launch {
             _selectedUserProfile.value = repository.getUserDirect(username)
@@ -135,26 +159,36 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val selectedUserPosts: StateFlow<List<PostEntity>> = combine(
-        repository.getAllPosts(),
+        allPosts,
         _selectedUsername
     ) { posts, username ->
         if (username.isNullOrEmpty()) emptyList()
-        else posts.filter { it.userId == username }
+        else posts.filter { it.userId == username || it.username == username }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val selectedUserReels: StateFlow<List<ReelEntity>> = combine(
-        repository.getAllReels(),
+        allReels,
         _selectedUsername
     ) { reels, username ->
         if (username.isNullOrEmpty()) emptyList()
         else reels.filter { it.username == username }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val currentUserPosts: StateFlow<List<PostEntity>> = repository.getPostsByUsername("my_username")
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val currentUserPosts: StateFlow<List<PostEntity>> = combine(
+        allPosts,
+        _currentUsername
+    ) { posts, username ->
+        if (username.isEmpty()) emptyList()
+        else posts.filter { it.userId == username || it.username == username }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val currentUserReels: StateFlow<List<ReelEntity>> = repository.getReelsByUsername("my_username")
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val currentUserReels: StateFlow<List<ReelEntity>> = combine(
+        allReels,
+        _currentUsername
+    ) { reels, username ->
+        if (username.isEmpty()) emptyList()
+        else reels.filter { it.username == username }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // SELECTED STORY FOR VIEWER
     private val _selectedStoryUser = MutableStateFlow<String?>(null)
@@ -189,15 +223,31 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val post = _activePostForComments.value ?: return
         if (text.isBlank()) return
         viewModelScope.launch {
+            val username = _currentUsername.value
+            val user = currentUser.value
             repository.addComment(
                 CommentEntity(
                     postId = post.id,
-                    username = "my_username",
-                    userAvatar = currentUser.value?.avatarUrl ?: "",
-                    text = text.trim()
+                    username = username,
+                    userAvatar = user?.avatarUrl ?: "",
+                    text = text.trim(),
+                    timestamp = "Just now"
                 )
             )
             repository.updatePost(post.copy(commentCount = post.commentCount + 1))
+            if (post.username != username) {
+                repository.addNotification(
+                    NotificationEntity(
+                        recipientUsername = post.username,
+                        actorUsername = username,
+                        actorAvatar = user?.avatarUrl ?: "",
+                        type = "comment",
+                        targetId = post.id,
+                        text = "commented: '${text.trim()}'",
+                        timestamp = "Just now"
+                    )
+                )
+            }
             showFeedback("Comment posted!")
         }
     }
@@ -213,35 +263,36 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // DIRECT MESSAGES & CALLS
-    private val _selectedConversationId = MutableStateFlow<String?>("elena_design")
+    private val _selectedConversationId = MutableStateFlow<String?>(null)
     val selectedConversationId: StateFlow<String?> = _selectedConversationId.asStateFlow()
 
-    val activeMessages: StateFlow<List<MessageEntity>> = combine(
-        repository.getAllPosts(),
-        _selectedConversationId
-    ) { _, convId ->
-        if (convId.isNullOrEmpty()) emptyList()
-        else repository.getMessagesForConversation(convId).stateIn(viewModelScope).value
+    val activeMessages: StateFlow<List<MessageEntity>> = _selectedConversationId.flatMapLatest { convId ->
+        if (convId.isNullOrEmpty()) flowOf(emptyList())
+        else repository.getMessagesForConversation(convId)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    fun openChat(conversationId: String) {
-        _selectedConversationId.value = conversationId
+    fun openChat(username: String) {
+        _selectedConversationId.value = username
         _currentScreen.value = AuraScreen.CHAT_DETAIL
     }
 
     fun sendMessage(text: String, mediaUrl: String = "", type: String = "text") {
-        val convId = _selectedConversationId.value ?: return
+        val recipient = _selectedConversationId.value ?: return
         if (text.isBlank() && mediaUrl.isBlank()) return
         viewModelScope.launch {
+            val sender = _currentUsername.value
+            val user = currentUser.value
             repository.sendMessage(
                 MessageEntity(
-                    conversationId = convId,
-                    senderUsername = "my_username",
-                    senderAvatar = currentUser.value?.avatarUrl ?: "",
+                    conversationId = recipient,
+                    senderUsername = sender,
+                    recipientUsername = recipient,
+                    senderAvatar = user?.avatarUrl ?: "",
                     text = text,
                     mediaUrl = mediaUrl,
                     type = type,
-                    isMine = true
+                    isMine = true,
+                    timestamp = "Just now"
                 )
             )
         }
@@ -258,12 +309,12 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val callState: StateFlow<CallState> = _callState.asStateFlow()
 
     fun startCall(isVideo: Boolean) {
-        val peer = _selectedConversationId.value ?: "Elena"
+        val peer = _selectedConversationId.value ?: "User"
         _callState.value = CallState(
             isActive = true,
             isVideo = isVideo,
             peerUsername = peer,
-            peerAvatar = "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500"
+            peerAvatar = ""
         )
     }
 
@@ -301,7 +352,24 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     // POST ACTIONS
     fun toggleLikePost(post: PostEntity) {
-        viewModelScope.launch { repository.toggleLikePost(post) }
+        viewModelScope.launch {
+            val username = _currentUsername.value
+            val user = currentUser.value
+            repository.toggleLikePost(post)
+            if (!post.isLiked && post.username != username) {
+                repository.addNotification(
+                    NotificationEntity(
+                        recipientUsername = post.username,
+                        actorUsername = username,
+                        actorAvatar = user?.avatarUrl ?: "",
+                        type = "like",
+                        targetId = post.id,
+                        text = "liked your post.",
+                        timestamp = "Just now"
+                    )
+                )
+            }
+        }
     }
 
     fun toggleSavePost(post: PostEntity) {
@@ -321,27 +389,33 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun deletePost(postId: Long) {
         viewModelScope.launch {
             repository.deletePost(postId)
+            val user = currentUser.value
+            if (user != null) {
+                repository.updateUser(user.copy(postCount = (user.postCount - 1).coerceAtLeast(0)))
+            }
             showFeedback("Post deleted")
         }
     }
 
     fun createPost(caption: String, location: String, mediaUrl: String, commentsDisabled: Boolean) {
         viewModelScope.launch {
+            val username = _currentUsername.value
             val user = currentUser.value
+            if (username.isBlank() || user == null) return@launch
+
             val newPost = PostEntity(
-                userId = "my_username",
-                username = "my_username",
-                userAvatar = user?.avatarUrl ?: "",
-                isVerified = user?.isVerified ?: false,
+                userId = username,
+                username = username,
+                userAvatar = user.avatarUrl,
+                isVerified = user.isVerified,
                 location = location,
                 caption = caption,
                 mediaUrlsJson = mediaUrl,
-                commentsDisabled = commentsDisabled
+                commentsDisabled = commentsDisabled,
+                timestamp = "Just now"
             )
             repository.createPost(newPost)
-            if (user != null) {
-                repository.updateUser(user.copy(postCount = user.postCount + 1))
-            }
+            repository.updateUser(user.copy(postCount = user.postCount + 1))
             showFeedback("Post published!")
             _currentScreen.value = AuraScreen.HOME
         }
@@ -350,15 +424,19 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     // STORY ACTIONS
     fun createStory(caption: String, mediaUrl: String, isCloseFriends: Boolean) {
         viewModelScope.launch {
+            val username = _currentUsername.value
             val user = currentUser.value
+            if (username.isBlank() || user == null) return@launch
+
             repository.createStory(
                 StoryEntity(
-                    username = "my_username",
-                    userAvatar = user?.avatarUrl ?: "",
-                    isVerified = user?.isVerified ?: false,
+                    username = username,
+                    userAvatar = user.avatarUrl,
+                    isVerified = user.isVerified,
                     mediaUrl = mediaUrl,
                     caption = caption,
-                    isCloseFriends = isCloseFriends
+                    isCloseFriends = isCloseFriends,
+                    timestamp = "Just now"
                 )
             )
             showFeedback("Story added!")
@@ -381,12 +459,15 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createReel(caption: String, videoUrl: String, thumbnailUrl: String) {
         viewModelScope.launch {
+            val username = _currentUsername.value
             val user = currentUser.value
+            if (username.isBlank() || user == null) return@launch
+
             repository.createReel(
                 ReelEntity(
-                    username = "my_username",
-                    userAvatar = user?.avatarUrl ?: "",
-                    isVerified = user?.isVerified ?: false,
+                    username = username,
+                    userAvatar = user.avatarUrl,
+                    isVerified = user.isVerified,
                     videoUrl = videoUrl.ifBlank { "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4" },
                     thumbnailUrl = thumbnailUrl,
                     caption = caption
@@ -400,10 +481,28 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     // FOLLOW / RELATIONSHIP
     fun toggleFollowUser(username: String) {
         viewModelScope.launch {
-            repository.toggleFollowUser(username, "my_username")
+            val current = _currentUsername.value
+            val user = currentUser.value
+            if (current.isBlank() || current == username) return@launch
+
+            repository.toggleFollowUser(username, current)
             val updated = repository.getUserDirect(username)
-            if (updated != null && _selectedUsername.value == username) {
-                _selectedUserProfile.value = updated
+            if (updated != null) {
+                if (_selectedUsername.value == username) {
+                    _selectedUserProfile.value = updated
+                }
+                if (updated.followStatus == "following" || updated.followStatus == "requested") {
+                    repository.addNotification(
+                        NotificationEntity(
+                            recipientUsername = username,
+                            actorUsername = current,
+                            actorAvatar = user?.avatarUrl ?: "",
+                            type = if (updated.followStatus == "requested") "follow_request" else "follow",
+                            text = if (updated.followStatus == "requested") "requested to follow you." else "started following you.",
+                            timestamp = "Just now"
+                        )
+                    )
+                }
             }
         }
     }
@@ -452,9 +551,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     // REPORTING & SAFETY
     fun submitReport(contentType: String, contentId: String, reason: String) {
         viewModelScope.launch {
+            val username = _currentUsername.value
             repository.submitReport(
                 ReportEntity(
-                    reporterUsername = "my_username",
+                    reporterUsername = username,
                     contentType = contentType,
                     contentId = contentId,
                     reason = reason
@@ -484,6 +584,11 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _currentScreen.value = screen
     }
 
+    fun switchAuthState(state: AuthState) {
+        _authError.value = null
+        _authState.value = state
+    }
+
     fun toggleTheme() {
         _isDarkTheme.value = !_isDarkTheme.value
     }
@@ -496,28 +601,72 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _userFeedback.value = null
     }
 
-    fun login(u: String, p: String) {
-        _authState.value = AuthState.LOGGED_IN
-        showFeedback("Welcome back to Aura!")
+    fun login(identifier: String, p: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            val (user, msg) = repository.loginUser(identifier, p)
+            _authLoading.value = false
+            if (user != null) {
+                sessionManager.saveSession(user.username)
+                _currentUsername.value = user.username
+                _authState.value = AuthState.LOGGED_IN
+                _currentScreen.value = AuraScreen.HOME
+                showFeedback("Welcome back, ${user.fullName}!")
+            } else {
+                _authError.value = msg
+            }
+        }
     }
 
     fun register(name: String, u: String, e: String, p: String) {
         viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            val cleanUsername = u.trim().lowercase()
             val newUser = UserEntity(
-                username = u.ifBlank { "new_user" },
-                fullName = name.ifBlank { "New Member" },
-                email = e,
-                avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+                username = cleanUsername,
+                fullName = name.trim(),
+                email = e.trim().lowercase(),
+                password = p,
+                avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
+                followerCount = 0,
+                followingCount = 0,
+                postCount = 0
             )
-            repository.insertUser(newUser)
-            _currentUsername.value = newUser.username
-            _authState.value = AuthState.LOGGED_IN
-            showFeedback("Account created! Welcome to Aura.")
+            val (success, msg) = repository.registerUser(newUser)
+            _authLoading.value = false
+            if (success) {
+                sessionManager.saveSession(cleanUsername)
+                _currentUsername.value = cleanUsername
+                _authState.value = AuthState.LOGGED_IN
+                _currentScreen.value = AuraScreen.HOME
+                showFeedback("Account created! Welcome to Aura, ${newUser.fullName}.")
+            } else {
+                _authError.value = msg
+            }
+        }
+    }
+
+    fun resetPassword(identifier: String, newPass: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            val (success, msg) = repository.resetPassword(identifier, newPass)
+            _authLoading.value = false
+            if (success) {
+                showFeedback("Password reset successfully! Please log in with your new password.")
+                _authState.value = AuthState.LOGIN
+            } else {
+                _authError.value = msg
+            }
         }
     }
 
     fun logout() {
+        sessionManager.clearSession()
+        _currentUsername.value = ""
         _authState.value = AuthState.LOGIN
-        showFeedback("Logged out")
+        showFeedback("Logged out successfully")
     }
 }

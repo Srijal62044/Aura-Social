@@ -19,6 +19,9 @@ interface AuraDao {
     @Query("SELECT * FROM users WHERE username = :username")
     suspend fun getUserDirect(username: String): UserEntity?
 
+    @Query("SELECT * FROM users WHERE username = :query OR email = :query LIMIT 1")
+    suspend fun getUserByUsernameOrEmail(query: String): UserEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertUsers(users: List<UserEntity>)
 

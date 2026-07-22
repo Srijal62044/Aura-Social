@@ -1,5 +1,5 @@
 {
-  "name": "Aura Social",
+  "name": "Aura",
   "description": "Next-generation social media app with posts, stories, reels, messaging, explore discovery, creator profiles, and moderation controls.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

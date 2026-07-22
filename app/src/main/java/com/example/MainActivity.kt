@@ -62,6 +62,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             val isDarkTheme by viewModel.isDarkTheme.collectAsStateWithLifecycle()
             val authState by viewModel.authState.collectAsStateWithLifecycle()
+            val authError by viewModel.authError.collectAsStateWithLifecycle()
+            val authLoading by viewModel.authLoading.collectAsStateWithLifecycle()
             val currentScreen by viewModel.currentScreen.collectAsStateWithLifecycle()
             val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
             val currentUsername by viewModel.currentUsername.collectAsStateWithLifecycle()
@@ -104,11 +106,12 @@ class MainActivity : ComponentActivity() {
                 if (authState != AuthState.LOGGED_IN) {
                     AuthScreen(
                         authState = authState,
+                        errorMessage = authError,
+                        isLoading = authLoading,
                         onLogin = { u, p -> viewModel.login(u, p) },
                         onRegister = { n, u, e, p -> viewModel.register(n, u, e, p) },
-                        onSwitchState = { newState ->
-                            viewModel.login("my_username", "")
-                        }
+                        onResetPassword = { u, p -> viewModel.resetPassword(u, p) },
+                        onSwitchState = { state -> viewModel.switchAuthState(state) }
                     )
                 } else {
                     val showTopAndBottomBars = currentScreen in listOf(

@@ -1,5 +1,8 @@
 package com.example.ui.screens
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -17,15 +20,21 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,13 +45,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.data.local.UserEntity
+import com.example.ui.theme.AuraOrange
 import com.example.ui.theme.AuraPink
+import com.example.ui.theme.AuraPurple
+import com.example.utils.MediaFileInfo
+import com.example.utils.getMediaFileInfo
 
 @Composable
 fun EditProfileScreen(
@@ -52,18 +66,24 @@ fun EditProfileScreen(
 ) {
     if (user == null) return
 
+    val context = LocalContext.current
     var fullName by remember { mutableStateOf(user.fullName) }
     var bio by remember { mutableStateOf(user.bio) }
     var website by remember { mutableStateOf(user.website) }
     var avatarUrl by remember { mutableStateOf(user.avatarUrl) }
     var isPrivate by remember { mutableStateOf(user.isPrivate) }
 
-    val sampleAvatars = listOf(
-        "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
-        "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=500",
-        "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500",
-        "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=500"
-    )
+    var selectedFileInfo by remember { mutableStateOf<MediaFileInfo?>(null) }
+
+    val photoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val fileInfo = getMediaFileInfo(context, uri)
+            selectedFileInfo = fileInfo
+            avatarUrl = uri.toString()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -108,7 +128,7 @@ fun EditProfileScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 16.dp)
+                .padding(vertical = 12.dp)
         ) {
             Box(contentAlignment = Alignment.Center) {
                 AsyncImage(
@@ -116,28 +136,58 @@ fun EditProfileScreen(
                     contentDescription = "Avatar",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
-                        .size(100.dp)
+                        .size(110.dp)
                         .clip(CircleShape)
                 )
             }
 
+            if (selectedFileInfo != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "📁 ${selectedFileInfo?.name} (${selectedFileInfo?.formattedSize})",
+                    fontSize = 11.sp,
+                    color = AuraOrange,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "Select Avatar Preset:",
-                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                sampleAvatars.forEach { url ->
-                    AsyncImage(
-                        model = url,
-                        contentDescription = "Avatar option",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(CircleShape)
-                            .clickable { avatarUrl = url }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = { photoPicker.launch("image/*") },
+                    shape = RoundedCornerShape(20.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraPurple),
+                    modifier = Modifier.testTag("choose_avatar_from_gallery")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AddPhotoAlternate,
+                        contentDescription = null,
+                        modifier = Modifier.padding(end = 6.dp)
                     )
+                    Text("Choose from Gallery", fontSize = 12.sp)
+                }
+
+                if (avatarUrl.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            avatarUrl = ""
+                            selectedFileInfo = null
+                        },
+                        shape = RoundedCornerShape(20.dp),
+                        modifier = Modifier.testTag("remove_avatar_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(end = 4.dp)
+                        )
+                        Text("Remove", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    }
                 }
             }
         }

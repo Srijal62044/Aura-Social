@@ -87,7 +87,17 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val currentUser: StateFlow<UserEntity?> = combine(_currentUsername, repository.getAllUsers()) { username, users ->
-        users.find { it.username == username }
+        if (username.isBlank()) {
+            null
+        } else {
+            users.find { it.username.equals(username, ignoreCase = true) }
+                ?: UserEntity(
+                    username = username,
+                    fullName = username,
+                    email = "",
+                    avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+                )
+        }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     // THEME & NAVIGATION
@@ -147,13 +157,20 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     val selectedUserProfile: StateFlow<UserEntity?> = _selectedUserProfile.asStateFlow()
 
     fun selectUserProfile(username: String) {
-        if (username == _currentUsername.value) {
+        if (username.equals(_currentUsername.value, ignoreCase = true)) {
             _currentScreen.value = AuraScreen.PROFILE
             return
         }
         _selectedUsername.value = username
         viewModelScope.launch {
-            _selectedUserProfile.value = repository.getUserDirect(username)
+            val profile = repository.getUserDirect(username)
+                ?: UserEntity(
+                    username = username,
+                    fullName = username,
+                    email = "",
+                    avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+                )
+            _selectedUserProfile.value = profile
             _currentScreen.value = AuraScreen.USER_PROFILE
         }
     }
@@ -163,7 +180,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _selectedUsername
     ) { posts, username ->
         if (username.isNullOrEmpty()) emptyList()
-        else posts.filter { it.userId == username || it.username == username }
+        else posts.filter { it.userId.equals(username, ignoreCase = true) || it.username.equals(username, ignoreCase = true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val selectedUserReels: StateFlow<List<ReelEntity>> = combine(
@@ -171,7 +188,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _selectedUsername
     ) { reels, username ->
         if (username.isNullOrEmpty()) emptyList()
-        else reels.filter { it.username == username }
+        else reels.filter { it.username.equals(username, ignoreCase = true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val currentUserPosts: StateFlow<List<PostEntity>> = combine(
@@ -179,7 +196,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _currentUsername
     ) { posts, username ->
         if (username.isEmpty()) emptyList()
-        else posts.filter { it.userId == username || it.username == username }
+        else posts.filter { it.userId.equals(username, ignoreCase = true) || it.username.equals(username, ignoreCase = true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val currentUserReels: StateFlow<List<ReelEntity>> = combine(
@@ -187,7 +204,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _currentUsername
     ) { reels, username ->
         if (username.isEmpty()) emptyList()
-        else reels.filter { it.username == username }
+        else reels.filter { it.username.equals(username, ignoreCase = true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // SELECTED STORY FOR VIEWER
@@ -400,13 +417,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun createPost(caption: String, location: String, mediaUrl: String, commentsDisabled: Boolean) {
         viewModelScope.launch {
             val username = _currentUsername.value
-            val user = currentUser.value
-            if (username.isBlank() || user == null) return@launch
+            if (username.isBlank()) {
+                showFeedback("Please log in to share a post.")
+                return@launch
+            }
+            val user = currentUser.value ?: repository.getUserDirect(username) ?: UserEntity(username = username, fullName = username, email = "")
 
             val newPost = PostEntity(
                 userId = username,
                 username = username,
-                userAvatar = user.avatarUrl,
+                userAvatar = user.avatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" },
                 isVerified = user.isVerified,
                 location = location,
                 caption = caption,
@@ -418,6 +438,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             repository.updateUser(user.copy(postCount = user.postCount + 1))
             showFeedback("Post published!")
             _currentScreen.value = AuraScreen.HOME
+            repository.refreshAllData()
         }
     }
 
@@ -425,13 +446,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun createStory(caption: String, mediaUrl: String, isCloseFriends: Boolean) {
         viewModelScope.launch {
             val username = _currentUsername.value
-            val user = currentUser.value
-            if (username.isBlank() || user == null) return@launch
+            if (username.isBlank()) {
+                showFeedback("Please log in to share a story.")
+                return@launch
+            }
+            val user = currentUser.value ?: repository.getUserDirect(username) ?: UserEntity(username = username, fullName = username, email = "")
 
             repository.createStory(
                 StoryEntity(
                     username = username,
-                    userAvatar = user.avatarUrl,
+                    userAvatar = user.avatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" },
                     isVerified = user.isVerified,
                     mediaUrl = mediaUrl,
                     caption = caption,
@@ -441,6 +465,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             )
             showFeedback("Story added!")
             _currentScreen.value = AuraScreen.HOME
+            repository.refreshAllData()
         }
     }
 
@@ -460,13 +485,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun createReel(caption: String, videoUrl: String, thumbnailUrl: String) {
         viewModelScope.launch {
             val username = _currentUsername.value
-            val user = currentUser.value
-            if (username.isBlank() || user == null) return@launch
+            if (username.isBlank()) {
+                showFeedback("Please log in to share a reel.")
+                return@launch
+            }
+            val user = currentUser.value ?: repository.getUserDirect(username) ?: UserEntity(username = username, fullName = username, email = "")
 
             repository.createReel(
                 ReelEntity(
                     username = username,
-                    userAvatar = user.avatarUrl,
+                    userAvatar = user.avatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" },
                     isVerified = user.isVerified,
                     videoUrl = videoUrl.ifBlank { "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4" },
                     thumbnailUrl = thumbnailUrl,
@@ -475,6 +503,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             )
             showFeedback("Reel uploaded!")
             _currentScreen.value = AuraScreen.REELS
+            repository.refreshAllData()
         }
     }
 

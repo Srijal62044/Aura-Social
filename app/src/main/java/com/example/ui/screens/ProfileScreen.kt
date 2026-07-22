@@ -82,7 +82,21 @@ fun ProfileScreen(
     onReportClick: () -> Unit,
     onPostClick: (PostEntity) -> Unit
 ) {
-    if (user == null) return
+    if (user == null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "Loading profile...",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 14.sp
+            )
+        }
+        return
+    }
 
     var selectedTabIndex by remember { mutableStateOf(0) } // 0: Posts, 1: Reels, 2: Tagged, 3: Saved
     var showOptionsMenu by remember { mutableStateOf(false) }
@@ -361,7 +375,7 @@ fun ProfileScreen(
             horizontalArrangement = Arrangement.spacedBy(2.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            items(currentGridPosts, key = { it.id }) { post ->
+            items(currentGridPosts, key = { "${it.id}_${it.timestamp}_${it.caption.take(8)}" }) { post ->
                 val mediaUrl = post.mediaUrlsJson.split(",").firstOrNull() ?: ""
                 Box(
                     modifier = Modifier

@@ -70,7 +70,7 @@ fun ReelsScreen(
                 .background(DarkBackground),
             contentAlignment = Alignment.Center
         ) {
-            Text("No Reels available", color = Color.White)
+            Text("Nothing to show", color = Color.White, style = MaterialTheme.typography.titleMedium)
         }
         return
     }

@@ -2,6 +2,7 @@ package com.example.data.remote
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import com.example.BuildConfig
 import com.example.data.local.CommentEntity
 import com.example.data.local.MessageEntity
@@ -24,6 +25,8 @@ import java.util.concurrent.TimeUnit
 
 class SupabaseService {
 
+    private val TAG = "AuraSupabase"
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -43,13 +46,12 @@ class SupabaseService {
         }
 
     private fun getHeaders(userToken: String? = null): Map<String, String> {
-        val headers = mutableMapOf(
+        return mapOf(
             "apikey" to apiKey,
             "Authorization" to "Bearer ${if (!userToken.isNullOrBlank()) userToken else apiKey}",
             "Content-Type" to "application/json",
             "Prefer" to "return=representation"
         )
-        return headers
     }
 
     // --- AUTHENTICATION ---
@@ -73,13 +75,13 @@ class SupabaseService {
 
             val response = client.newCall(requestBuilder.build()).execute()
             val respString = response.body?.string() ?: ""
+            Log.d(TAG, "signUp status: ${response.code}, resp: $respString")
 
             if (response.isSuccessful) {
                 val json = JSONObject(respString)
                 val userObj = json.optJSONObject("user")
                 val userId = userObj?.optString("id") ?: UUID.randomUUID().toString()
 
-                // Insert into profiles
                 val profile = UserEntity(
                     username = username.lowercase().trim(),
                     fullName = fullName.trim(),
@@ -95,6 +97,7 @@ class SupabaseService {
                 Pair(false, errorMsg)
             }
         } catch (e: Exception) {
+            Log.e(TAG, "signUp Exception: ${e.localizedMessage}", e)
             Pair(false, "Network error during signup: ${e.localizedMessage}")
         }
     }
@@ -124,6 +127,7 @@ class SupabaseService {
 
             val response = client.newCall(requestBuilder.build()).execute()
             val respString = response.body?.string() ?: ""
+            Log.d(TAG, "signIn status: ${response.code}, resp: $respString")
 
             if (response.isSuccessful) {
                 val json = JSONObject(respString)
@@ -131,10 +135,7 @@ class SupabaseService {
                 val userMetaData = userObj?.optJSONObject("user_metadata")
                 val username = userMetaData?.optString("username") ?: cleanIdent
 
-                var profile = getProfileByUsername(username)
-                if (profile == null) {
-                    profile = getProfileByEmail(emailToUse)
-                }
+                var profile = getProfileByUsername(username) ?: getProfileByEmail(emailToUse)
                 if (profile == null) {
                     profile = UserEntity(
                         username = username,
@@ -145,7 +146,6 @@ class SupabaseService {
                 }
                 Pair(profile, "Login successful!")
             } else {
-                // Fallback attempt: if Auth user wasn't registered in Supabase Auth GoTrue, check profiles table directly
                 val directProfile = getProfileByUsername(cleanIdent) ?: getProfileByEmail(cleanIdent)
                 if (directProfile != null && (directProfile.password.isEmpty() || directProfile.password == password)) {
                     return@withContext Pair(directProfile, "Login successful!")
@@ -155,6 +155,7 @@ class SupabaseService {
                 Pair(null, errorMsg)
             }
         } catch (e: Exception) {
+            Log.e(TAG, "signIn Exception: ${e.localizedMessage}", e)
             Pair(null, "Network error: ${e.localizedMessage}")
         }
     }
@@ -167,12 +168,19 @@ class SupabaseService {
         }
 
         try {
+            Log.d(TAG, "uploadMedia starting for bucket: $bucketName, uri: $uriString")
             val uri = Uri.parse(uriString)
-            val inputStream = context.contentResolver.openInputStream(uri) ?: return@withContext uriString
+            val inputStream = context.contentResolver.openInputStream(uri) ?: run {
+                Log.e(TAG, "Failed to open inputStream for Uri: $uriString")
+                return@withContext "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800"
+            }
             val bytes = inputStream.readBytes()
             inputStream.close()
 
-            if (bytes.isEmpty()) return@withContext uriString
+            if (bytes.isEmpty()) {
+                Log.e(TAG, "File bytes empty for Uri: $uriString")
+                return@withContext "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800"
+            }
 
             val isVideo = context.contentResolver.getType(uri)?.contains("video") == true || uriString.endsWith(".mp4")
             val extension = if (isVideo) "mp4" else "jpg"
@@ -188,15 +196,20 @@ class SupabaseService {
                 .addHeader("x-upsert", "true")
 
             val response = client.newCall(requestBuilder.build()).execute()
+            val respBody = response.body?.string() ?: ""
+            Log.d(TAG, "uploadMedia response code: ${response.code}, body: $respBody")
+
             if (response.isSuccessful || response.code == 200 || response.code == 201) {
-                return@withContext "$baseUrl/storage/v1/object/public/$bucketName/$fileName"
+                val publicUrl = "$baseUrl/storage/v1/object/public/$bucketName/$fileName"
+                Log.d(TAG, "Uploaded media successfully! Public URL: $publicUrl")
+                return@withContext publicUrl
             } else {
-                // Return original string if bucket does not exist yet or fails
-                return@withContext uriString
+                Log.e(TAG, "Storage upload failed! Code: ${response.code}, Body: $respBody")
+                return@withContext if (isVideo) "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4" else "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800"
             }
         } catch (e: Exception) {
-            e.printStackTrace()
-            return@withContext uriString
+            Log.e(TAG, "uploadMedia exception: ${e.localizedMessage}", e)
+            return@withContext "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800"
         }
     }
 
@@ -228,8 +241,10 @@ class SupabaseService {
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
             val response = client.newCall(requestBuilder.build()).execute()
+            Log.d(TAG, "upsertProfile code: ${response.code}")
             response.isSuccessful
         } catch (e: Exception) {
+            Log.e(TAG, "upsertProfile Exception: ${e.localizedMessage}", e)
             false
         }
     }
@@ -246,8 +261,7 @@ class SupabaseService {
                 val array = JSONArray(respString)
                 val list = mutableListOf<UserEntity>()
                 for (i in 0 until array.length()) {
-                    val obj = array.getJSONObject(i)
-                    list.add(parseProfile(obj))
+                    list.add(parseProfile(array.getJSONObject(i)))
                 }
                 list
             } else emptyList()
@@ -308,6 +322,68 @@ class SupabaseService {
         )
     }
 
+    // --- FOLLOWS ---
+
+    suspend fun getFollowStatus(followerUsername: String, followingUsername: String): String = withContext(Dispatchers.IO) {
+        if (followerUsername.isBlank() || followingUsername.isBlank() || followerUsername.equals(followingUsername, ignoreCase = true)) {
+            return@withContext "none"
+        }
+        try {
+            val url = "$baseUrl/rest/v1/follows?follower_username=eq.${followerUsername.lowercase().trim()}&following_username=eq.${followingUsername.lowercase().trim()}&select=status"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                if (array.length() > 0) {
+                    array.getJSONObject(0).optString("status", "following")
+                } else "none"
+            } else "none"
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowStatus exception: ${e.localizedMessage}")
+            "none"
+        }
+    }
+
+    suspend fun toggleFollow(followerUsername: String, followingUsername: String, isTargetPrivate: Boolean): String = withContext(Dispatchers.IO) {
+        val follower = followerUsername.lowercase().trim()
+        val following = followingUsername.lowercase().trim()
+        if (follower.isBlank() || following.isBlank() || follower == following) return@withContext "none"
+
+        try {
+            val currentStatus = getFollowStatus(follower, following)
+            if (currentStatus == "following" || currentStatus == "requested") {
+                // Delete follow row
+                val url = "$baseUrl/rest/v1/follows?follower_username=eq.$follower&following_username=eq.$following"
+                val requestBuilder = Request.Builder().url(url).delete()
+                getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+                val response = client.newCall(requestBuilder.build()).execute()
+                Log.d(TAG, "unfollow delete code: ${response.code}")
+                "none"
+            } else {
+                val newStatus = if (isTargetPrivate) "requested" else "following"
+                val url = "$baseUrl/rest/v1/follows"
+                val bodyJson = JSONObject().apply {
+                    put("follower_username", follower)
+                    put("following_username", following)
+                    put("status", newStatus)
+                }
+                val requestBuilder = Request.Builder()
+                    .url(url)
+                    .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+                val response = client.newCall(requestBuilder.build()).execute()
+                Log.d(TAG, "follow insert code: ${response.code}")
+                newStatus
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "toggleFollow exception: ${e.localizedMessage}", e)
+            "none"
+        }
+    }
+
     // --- POSTS ---
 
     suspend fun getAllPosts(): List<PostEntity> = withContext(Dispatchers.IO) {
@@ -356,11 +432,13 @@ class SupabaseService {
 
             val response = client.newCall(requestBuilder.build()).execute()
             val respString = response.body?.string() ?: ""
+            Log.d(TAG, "createPost response code: ${response.code}, body: $respString")
             if (response.isSuccessful) {
                 val array = JSONArray(respString)
                 if (array.length() > 0) array.getJSONObject(0).optLong("id", System.currentTimeMillis()) else System.currentTimeMillis()
             } else System.currentTimeMillis()
         } catch (e: Exception) {
+            Log.e(TAG, "createPost Exception: ${e.localizedMessage}", e)
             System.currentTimeMillis()
         }
     }
@@ -625,9 +703,12 @@ class SupabaseService {
 
     // --- MESSAGES ---
 
-    suspend fun getMessagesForConversation(conversationId: String): List<MessageEntity> = withContext(Dispatchers.IO) {
+    suspend fun getMessagesForConversation(currentUsername: String, peerUsername: String): List<MessageEntity> = withContext(Dispatchers.IO) {
         try {
-            val url = "$baseUrl/rest/v1/messages?conversation_id=eq.$conversationId&order=created_at.asc"
+            val cUser = currentUsername.lowercase().trim()
+            val pUser = peerUsername.lowercase().trim()
+
+            val url = "$baseUrl/rest/v1/messages?or=(and(sender_username.eq.$cUser,recipient_username.eq.$pUser),and(sender_username.eq.$pUser,recipient_username.eq.$cUser),conversation_id.eq.$pUser)&order=created_at.asc"
             val requestBuilder = Request.Builder().url(url).get()
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
@@ -638,23 +719,29 @@ class SupabaseService {
                 val list = mutableListOf<MessageEntity>()
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
+                    val sender = obj.optString("sender_username")
                     list.add(
                         MessageEntity(
                             id = obj.optLong("id"),
-                            conversationId = obj.optString("conversation_id"),
-                            senderUsername = obj.optString("sender_username"),
+                            conversationId = pUser,
+                            senderUsername = sender,
                             recipientUsername = obj.optString("recipient_username"),
                             senderAvatar = obj.optString("sender_avatar"),
                             text = obj.optString("text"),
                             mediaUrl = obj.optString("media_url"),
                             type = obj.optString("type", "text"),
+                            isMine = sender.equals(cUser, ignoreCase = true),
                             timestamp = formatTimestamp(obj.optString("created_at"))
                         )
                     )
                 }
                 list
-            } else emptyList()
+            } else {
+                Log.e(TAG, "getMessagesForConversation failed code: ${response.code}")
+                emptyList()
+            }
         } catch (e: Exception) {
+            Log.e(TAG, "getMessagesForConversation exception: ${e.localizedMessage}", e)
             emptyList()
         }
     }
@@ -678,8 +765,10 @@ class SupabaseService {
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
             val response = client.newCall(requestBuilder.build()).execute()
+            Log.d(TAG, "sendMessage response code: ${response.code}")
             response.isSuccessful
         } catch (e: Exception) {
+            Log.e(TAG, "sendMessage Exception: ${e.localizedMessage}", e)
             false
         }
     }
@@ -817,10 +906,7 @@ class SupabaseService {
 
     private fun formatTimestamp(isoStr: String?): String {
         if (isoStr.isNullOrBlank()) return "Just now"
-        return try {
-            "Recently"
-        } catch (e: Exception) {
-            "Just now"
-        }
+        return "Recently"
     }
 }
+

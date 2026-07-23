@@ -59,8 +59,28 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        try {
+            val imageLoader = coil.ImageLoader.Builder(this)
+                .okHttpClient {
+                    okhttp3.OkHttpClient.Builder()
+                        .addInterceptor { chain ->
+                            val request = chain.request().newBuilder()
+                                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+                                .build()
+                            chain.proceed(request)
+                        }
+                        .build()
+                }
+                .crossfade(true)
+                .build()
+            coil.Coil.setImageLoader(imageLoader)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         setContent {
             val isDarkTheme by viewModel.isDarkTheme.collectAsStateWithLifecycle()
+            val currentLanguage by viewModel.currentLanguage.collectAsStateWithLifecycle()
             val authState by viewModel.authState.collectAsStateWithLifecycle()
             val authError by viewModel.authError.collectAsStateWithLifecycle()
             val authLoading by viewModel.authLoading.collectAsStateWithLifecycle()
@@ -142,6 +162,7 @@ class MainActivity : ComponentActivity() {
                             if (showTopAndBottomBars) {
                                 AuraBottomNavigation(
                                     currentScreen = currentScreen,
+                                    currentLanguage = currentLanguage,
                                     onNavigate = { viewModel.navigateTo(it) }
                                 )
                             }
@@ -309,12 +330,16 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     AuraScreen.SETTINGS -> SettingsPrivacyScreen(
+                                        user = currentUser,
                                         isDarkTheme = isDarkTheme,
                                         isAdmin = currentUser?.isAdmin ?: true,
+                                        currentLanguage = currentLanguage,
                                         onBackClick = { viewModel.navigateTo(AuraScreen.PROFILE) },
                                         onToggleTheme = { viewModel.toggleTheme() },
                                         onOpenAdminDashboard = { viewModel.navigateTo(AuraScreen.ADMIN_DASHBOARD) },
-                                        onLogout = { viewModel.logout() }
+                                        onLanguageChange = { viewModel.setLanguage(it) },
+                                        onLogout = { viewModel.logout() },
+                                        onShowFeedback = { msg -> viewModel.showFeedback(msg) }
                                     )
 
                                     AuraScreen.ADMIN_DASHBOARD -> AdminDashboardScreen(

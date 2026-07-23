@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -87,8 +88,9 @@ fun PostCard(
     val coroutineScope = rememberCoroutineScope()
 
     val mediaList = remember(post.mediaUrlsJson) {
-        if (post.mediaUrlsJson.isBlank()) listOf("https://images.unsplash.com/photo-1518770660439-4636190af475?w=800")
-        else post.mediaUrlsJson.split(",")
+        val list = post.mediaUrlsJson.split(",").map { it.trim() }.filter { it.isNotBlank() }
+        if (list.isEmpty()) listOf("https://picsum.photos/id/1015/800/800")
+        else list
     }
 
     val pagerState = rememberPagerState(pageCount = { mediaList.size })
@@ -241,13 +243,25 @@ fun PostCard(
         ) {
             HorizontalPager(
                 state = pagerState,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxSize()
             ) { page ->
+                val mediaPath = mediaList[page]
+                val mediaModel = remember(mediaPath) {
+                    when {
+                        mediaPath.startsWith("content://") -> android.net.Uri.parse(mediaPath)
+                        mediaPath.startsWith("/") -> java.io.File(mediaPath)
+                        else -> mediaPath
+                    }
+                }
                 AsyncImage(
-                    model = mediaList[page],
+                    model = coil.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
+                        .data(mediaModel)
+                        .crossfade(true)
+                        .error(android.R.drawable.ic_menu_gallery)
+                        .build(),
                     contentDescription = "Post image $page",
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxSize()
                 )
             }
 

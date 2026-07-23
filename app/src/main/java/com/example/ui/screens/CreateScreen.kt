@@ -110,7 +110,7 @@ fun CreateScreen(
             selectedMediaList.clear()
             val fileInfos = uris.map { getMediaFileInfo(context, it) }
             selectedMediaList.addAll(fileInfos)
-            primaryMediaUrl = fileInfos.first().uri.toString()
+            primaryMediaUrl = fileInfos.joinToString(",") { it.persistentPath }
 
             // Simulate progress
             isUploading = true
@@ -127,8 +127,8 @@ fun CreateScreen(
             val fileInfo = getMediaFileInfo(context, uri)
             selectedMediaList.clear()
             selectedMediaList.add(fileInfo)
-            primaryMediaUrl = uri.toString()
-            videoUrl = uri.toString()
+            primaryMediaUrl = fileInfo.persistentPath
+            videoUrl = fileInfo.persistentPath
 
             isUploading = true
             uploadProgress = 0.2f
@@ -144,7 +144,7 @@ fun CreateScreen(
             val fileInfo = getMediaFileInfo(context, uri)
             selectedMediaList.clear()
             selectedMediaList.add(fileInfo)
-            primaryMediaUrl = uri.toString()
+            primaryMediaUrl = fileInfo.persistentPath
 
             isUploading = true
             uploadProgress = 0.2f
@@ -201,8 +201,16 @@ fun CreateScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
+                val previewPath = primaryMediaUrl.split(",").firstOrNull() ?: primaryMediaUrl
+                val previewModel = remember(previewPath) {
+                    when {
+                        previewPath.startsWith("content://") -> Uri.parse(previewPath)
+                        previewPath.startsWith("/") -> java.io.File(previewPath)
+                        else -> previewPath
+                    }
+                }
                 AsyncImage(
-                    model = primaryMediaUrl,
+                    model = previewModel,
                     contentDescription = "Selected media preview",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()

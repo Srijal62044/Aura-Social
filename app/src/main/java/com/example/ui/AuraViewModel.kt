@@ -26,7 +26,170 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+
+private val defaultMockUsersList = listOf(
+    UserEntity(
+        username = "sophia_vibe",
+        fullName = "Sophia Williams",
+        email = "sophia@aura.app",
+        avatarUrl = "https://picsum.photos/id/64/300/300",
+        bio = "Digital Creator | Travel & Aesthetics ✨",
+        isVerified = true,
+        followerCount = 14200,
+        followingCount = 380,
+        postCount = 42
+    ),
+    UserEntity(
+        username = "alex_creative",
+        fullName = "Alex Rivera",
+        email = "alex@aura.app",
+        avatarUrl = "https://picsum.photos/id/91/300/300",
+        bio = "Architectural Photography & Design 🏙️",
+        isVerified = true,
+        followerCount = 8900,
+        followingCount = 210,
+        postCount = 28
+    ),
+    UserEntity(
+        username = "neha_artist",
+        fullName = "Neha Sharma",
+        email = "neha@aura.app",
+        avatarUrl = "https://picsum.photos/id/338/300/300",
+        bio = "Illustrator & Concept Artist 🎨",
+        isVerified = false,
+        followerCount = 5600,
+        followingCount = 430,
+        postCount = 35
+    ),
+    UserEntity(
+        username = "aura_official",
+        fullName = "Aura Social",
+        email = "support@aura.app",
+        avatarUrl = "https://picsum.photos/id/1027/300/300",
+        bio = "Official Aura Updates & Highlights 🚀",
+        isVerified = true,
+        isAdmin = true,
+        followerCount = 105000,
+        followingCount = 12,
+        postCount = 150
+    )
+)
+
+private val defaultMockPostsList = listOf(
+    PostEntity(
+        id = 101L,
+        userId = "sophia_vibe",
+        username = "sophia_vibe",
+        userAvatar = "https://picsum.photos/id/64/300/300",
+        isVerified = true,
+        location = "Santorini, Greece",
+        timestamp = "2h ago",
+        caption = "Sunset memories by the Aegean Sea 🌅✨ Golden hour perfection!",
+        hashtags = "#Sunset #TravelVibes #Greece",
+        mediaUrlsJson = "https://picsum.photos/id/1015/800/800,https://picsum.photos/id/1025/800/800",
+        likeCount = 342,
+        commentCount = 18
+    ),
+    PostEntity(
+        id = 102L,
+        userId = "alex_creative",
+        username = "alex_creative",
+        userAvatar = "https://picsum.photos/id/91/300/300",
+        isVerified = true,
+        location = "Tokyo, Japan",
+        timestamp = "5h ago",
+        caption = "Minimalist geometry and neon lights in Shibuya 🏙️⚡",
+        hashtags = "#Tokyo #Architecture #Minimal",
+        mediaUrlsJson = "https://picsum.photos/id/1069/800/800",
+        likeCount = 589,
+        commentCount = 34
+    ),
+    PostEntity(
+        id = 103L,
+        userId = "neha_artist",
+        username = "neha_artist",
+        userAvatar = "https://picsum.photos/id/338/300/300",
+        isVerified = false,
+        location = "Mumbai, India",
+        timestamp = "1d ago",
+        caption = "Fresh digital art piece inspired by nature 🌿 Palette of green and gold.",
+        hashtags = "#DigitalArt #Creative #Illustration",
+        mediaUrlsJson = "https://picsum.photos/id/1080/800/800",
+        likeCount = 215,
+        commentCount = 12
+    ),
+    PostEntity(
+        id = 104L,
+        userId = "aura_official",
+        username = "aura_official",
+        userAvatar = "https://picsum.photos/id/1027/300/300",
+        isVerified = true,
+        location = "Aura World",
+        timestamp = "2d ago",
+        caption = "Welcome to Aura! Express yourself, connect with creators, and share your aura with the world 💖",
+        hashtags = "#AuraApp #Welcome #Connect",
+        mediaUrlsJson = "https://picsum.photos/id/1062/800/800",
+        likeCount = 1250,
+        commentCount = 89
+    )
+)
+
+private val defaultMockStoriesList = listOf(
+    StoryEntity(
+        id = 201L,
+        username = "sophia_vibe",
+        userAvatar = "https://picsum.photos/id/64/300/300",
+        isVerified = true,
+        mediaUrl = "https://picsum.photos/id/1015/800/1200",
+        caption = "Good morning! ☕",
+        timestamp = "1h ago"
+    ),
+    StoryEntity(
+        id = 202L,
+        username = "alex_creative",
+        userAvatar = "https://picsum.photos/id/91/300/300",
+        isVerified = true,
+        mediaUrl = "https://picsum.photos/id/1069/800/1200",
+        caption = "Shooting location today 📸",
+        timestamp = "3h ago"
+    ),
+    StoryEntity(
+        id = 203L,
+        username = "neha_artist",
+        userAvatar = "https://picsum.photos/id/338/300/300",
+        isVerified = false,
+        mediaUrl = "https://picsum.photos/id/1080/800/1200",
+        caption = "Work in progress ✨",
+        timestamp = "5h ago"
+    )
+)
+
+private val defaultMockReelsList = listOf(
+    ReelEntity(
+        id = 301L,
+        username = "sophia_vibe",
+        userAvatar = "https://picsum.photos/id/64/300/300",
+        isVerified = true,
+        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+        thumbnailUrl = "https://picsum.photos/id/1015/800/1200",
+        caption = "Coastal vibes & oceanic aesthetics 🌊✨",
+        likeCount = 1420,
+        commentCount = 85
+    ),
+    ReelEntity(
+        id = 302L,
+        username = "alex_creative",
+        userAvatar = "https://picsum.photos/id/91/300/300",
+        isVerified = true,
+        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+        thumbnailUrl = "https://picsum.photos/id/1069/800/1200",
+        caption = "Urban exploration in 4K 🌃",
+        likeCount = 2300,
+        commentCount = 112
+    )
+)
 
 enum class AuraScreen {
     HOME, EXPLORE, CREATE, REELS, PROFILE, DIRECT_MESSAGES, CHAT_DETAIL,
@@ -84,6 +247,18 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             _authState.value = AuthState.LOGIN
         }
+
+        // Periodic polling loop for active conversation messages and feeds
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(2500)
+                val activePeer = _selectedConversationId.value
+                val current = _currentUsername.value
+                if (!activePeer.isNullOrBlank() && current.isNotBlank() && _currentScreen.value == AuraScreen.CHAT_DETAIL) {
+                    repository.fetchMessages(current, activePeer)
+                }
+            }
+        }
     }
 
     val currentUser: StateFlow<UserEntity?> = combine(_currentUsername, repository.getAllUsers()) { username, users ->
@@ -100,9 +275,22 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    // THEME & NAVIGATION
+    // THEME & NAVIGATION & LANGUAGE
     private val _isDarkTheme = MutableStateFlow(true)
     val isDarkTheme: StateFlow<Boolean> = _isDarkTheme.asStateFlow()
+
+    fun toggleTheme() {
+        _isDarkTheme.value = !_isDarkTheme.value
+        showFeedback(if (_isDarkTheme.value) "Dark Theme Enabled" else "Light Theme Enabled")
+    }
+
+    private val _currentLanguage = MutableStateFlow("English (US)")
+    val currentLanguage: StateFlow<String> = _currentLanguage.asStateFlow()
+
+    fun setLanguage(lang: String) {
+        _currentLanguage.value = lang
+        showFeedback("Language changed to $lang")
+    }
 
     private val _currentScreen = MutableStateFlow(AuraScreen.HOME)
     val currentScreen: StateFlow<AuraScreen> = _currentScreen.asStateFlow()
@@ -291,6 +479,9 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun openChat(username: String) {
         _selectedConversationId.value = username
         _currentScreen.value = AuraScreen.CHAT_DETAIL
+        viewModelScope.launch {
+            repository.fetchMessages(_currentUsername.value, username)
+        }
     }
 
     fun sendMessage(text: String, mediaUrl: String = "", type: String = "text") {
@@ -327,12 +518,18 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startCall(isVideo: Boolean) {
         val peer = _selectedConversationId.value ?: "User"
-        _callState.value = CallState(
-            isActive = true,
-            isVideo = isVideo,
-            peerUsername = peer,
-            peerAvatar = ""
-        )
+        viewModelScope.launch {
+            val peerUser = repository.getUserDirect(peer)
+            _callState.value = CallState(
+                isActive = true,
+                isVideo = isVideo,
+                peerUsername = peer,
+                peerAvatar = peerUser?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+            )
+            val appId = try { com.example.BuildConfig.AGORA_APP_ID } catch (e: Exception) { "9ce58239a9b7417b8e2cf0e16bd4926f" }
+            android.util.Log.d("AuraCall", "Starting RTC Call session with Agora App ID: $appId channel: ${_currentUsername.value}_$peer")
+            showFeedback(if (isVideo) "Connecting video call with @$peer..." else "Connecting voice call with @$peer...")
+        }
     }
 
     fun endCall() {
@@ -621,10 +818,6 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun switchAuthState(state: AuthState) {
         _authError.value = null
         _authState.value = state
-    }
-
-    fun toggleTheme() {
-        _isDarkTheme.value = !_isDarkTheme.value
     }
 
     fun showFeedback(message: String) {

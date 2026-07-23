@@ -4,27 +4,46 @@ import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 
-private val ElegantDarkColorScheme = darkColorScheme(
-    primary = VoraLavender,
-    primaryContainer = VoraDeepViolet,
-    secondary = VoraDeepViolet,
-    tertiary = VoraRose,
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.ui.graphics.Color
+
+private val PremiumDarkColorScheme = darkColorScheme(
+    primary = AuraVioletPrimary,
+    primaryContainer = AuraVioletContainer,
+    secondary = AuraPinkSecondary,
+    tertiary = AuraCyanAccent,
     background = DarkBackground,
     surface = DarkSurface,
     surfaceVariant = DarkSurfaceVariant,
     onPrimary = DarkBackground,
-    onPrimaryContainer = VoraLavender,
-    onSecondary = DarkOnSurface,
-    onBackground = DarkOnSurface,
+    onPrimaryContainer = DarkOnBackground,
+    onSecondary = DarkOnBackground,
+    onBackground = DarkOnBackground,
     onSurface = DarkOnSurface,
-    onSurfaceVariant = VoraMutedGray,
-    outline = VoraOutline
+    onSurfaceVariant = DarkMutedText,
+    outline = DarkOutline
+)
+
+private val PremiumLightColorScheme = lightColorScheme(
+    primary = AuraVioletPrimary,
+    primaryContainer = Color(0xFFF3E8FF),
+    secondary = AuraPinkSecondary,
+    tertiary = AuraCyanAccent,
+    background = LightBackground,
+    surface = LightSurface,
+    surfaceVariant = LightSurfaceVariant,
+    onPrimary = Color.White,
+    onPrimaryContainer = Color(0xFF3B0764),
+    onSecondary = Color.White,
+    onBackground = LightOnBackground,
+    onSurface = LightOnSurface,
+    onSurfaceVariant = LightMutedText,
+    outline = LightOutline
 )
 
 @Composable
@@ -32,7 +51,7 @@ fun AuraTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit
 ) {
-    val colorScheme = ElegantDarkColorScheme
+    val colorScheme = if (darkTheme) PremiumDarkColorScheme else PremiumLightColorScheme
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {

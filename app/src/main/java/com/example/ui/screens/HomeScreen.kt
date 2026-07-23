@@ -66,8 +66,8 @@ fun HomeScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "Welcome to Aura! Your feed is empty.\nCreate your first post or search for users to follow.",
-                            style = MaterialTheme.typography.bodyLarge.copy(
+                            text = "Nothing to show",
+                            style = MaterialTheme.typography.titleMedium.copy(
                                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                             ),
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center

@@ -128,18 +128,23 @@ class AuraRepository(
     }
 
     suspend fun toggleFollowUser(targetUsername: String, currentUsername: String) {
-        val user = getUserDirect(targetUsername) ?: return
-        val newStatus = when (user.followStatus) {
-            "following" -> "none"
-            "requested" -> "none"
-            else -> if (user.isPrivate) "requested" else "following"
-        }
-        val delta = if (newStatus == "following") 1 else if (user.followStatus == "following") -1 else 0
-        val updatedUser = user.copy(
+        val targetUser = getUserDirect(targetUsername) ?: return
+        val newStatus = supabase.toggleFollow(currentUsername, targetUsername, targetUser.isPrivate)
+        val currentUserProfile = getUserDirect(currentUsername)
+
+        val updatedTarget = targetUser.copy(
             followStatus = newStatus,
-            followerCount = (user.followerCount + delta).coerceAtLeast(0)
+            followerCount = if (newStatus == "following") targetUser.followerCount + 1 else if (newStatus == "none" && targetUser.followStatus == "following") (targetUser.followerCount - 1).coerceAtLeast(0) else targetUser.followerCount
         )
-        supabase.upsertProfile(updatedUser)
+        supabase.upsertProfile(updatedTarget)
+
+        if (currentUserProfile != null) {
+            val updatedCurrent = currentUserProfile.copy(
+                followingCount = if (newStatus == "following") currentUserProfile.followingCount + 1 else if (newStatus == "none" && targetUser.followStatus == "following") (currentUserProfile.followingCount - 1).coerceAtLeast(0) else currentUserProfile.followingCount
+            )
+            supabase.upsertProfile(updatedCurrent)
+        }
+
         fetchUsers()
 
         if (newStatus == "following" || newStatus == "requested") {
@@ -147,7 +152,7 @@ class AuraRepository(
                 NotificationEntity(
                     recipientUsername = targetUsername,
                     actorUsername = currentUsername,
-                    actorAvatar = "",
+                    actorAvatar = currentUserProfile?.avatarUrl ?: "",
                     type = if (newStatus == "requested") "follow_request" else "follow",
                     text = if (newStatus == "requested") "requested to follow you" else "started following you"
                 )
@@ -202,8 +207,14 @@ class AuraRepository(
 
     suspend fun createPost(post: PostEntity, appContext: Context? = context): Long {
         var mediaUrl = post.mediaUrlsJson
-        if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
-            mediaUrl = supabase.uploadMedia(appContext, "post-media", mediaUrl)
+        if (appContext != null && mediaUrl.isNotBlank()) {
+            val urls = mediaUrl.split(",").map { it.trim() }
+            val uploaded = urls.map { u ->
+                if (u.startsWith("content://") || u.startsWith("file://")) {
+                    supabase.uploadMedia(appContext, "post-media", u)
+                } else u
+            }
+            mediaUrl = uploaded.joinToString(",")
         }
         val cleanPost = post.copy(mediaUrlsJson = mediaUrl)
         val postId = supabase.createPost(cleanPost)
@@ -334,8 +345,9 @@ class AuraRepository(
         map[conversationId] ?: emptyList()
     }
 
-    suspend fun fetchMessages(conversationId: String) {
-        val list = supabase.getMessagesForConversation(conversationId)
+    suspend fun fetchMessages(currentUsername: String, conversationId: String) {
+        if (currentUsername.isBlank() || conversationId.isBlank()) return
+        val list = supabase.getMessagesForConversation(currentUsername, conversationId)
         _messagesMap.value = _messagesMap.value.toMutableMap().apply { put(conversationId, list) }
     }
 
@@ -346,7 +358,7 @@ class AuraRepository(
         }
         val cleanMsg = message.copy(mediaUrl = mediaUrl)
         supabase.sendMessage(cleanMsg)
-        fetchMessages(message.conversationId)
+        fetchMessages(message.senderUsername, message.conversationId)
     }
 
     suspend fun deleteMessage(messageId: Long) {

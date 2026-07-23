@@ -23,9 +23,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import com.example.ui.AuraScreen
 
+import com.example.ui.util.LocalizedStrings
+
 @Composable
 fun AuraBottomNavigation(
     currentScreen: AuraScreen,
+    currentLanguage: String = "English (US)",
     onNavigate: (AuraScreen) -> Unit
 ) {
     val navColors = NavigationBarItemDefaults.colors(
@@ -52,7 +55,7 @@ fun AuraBottomNavigation(
                     contentDescription = "Home"
                 )
             },
-            label = { Text("Home") },
+            label = { Text(LocalizedStrings.get("home", currentLanguage)) },
             modifier = Modifier.testTag("nav_home"),
             colors = navColors
         )
@@ -66,7 +69,7 @@ fun AuraBottomNavigation(
                     contentDescription = "Explore"
                 )
             },
-            label = { Text("Explore") },
+            label = { Text(LocalizedStrings.get("explore", currentLanguage)) },
             modifier = Modifier.testTag("nav_explore"),
             colors = navColors
         )
@@ -80,7 +83,7 @@ fun AuraBottomNavigation(
                     contentDescription = "Create"
                 )
             },
-            label = { Text("Create") },
+            label = { Text(LocalizedStrings.get("create", currentLanguage)) },
             modifier = Modifier.testTag("nav_create"),
             colors = navColors
         )
@@ -94,7 +97,7 @@ fun AuraBottomNavigation(
                     contentDescription = "Reels"
                 )
             },
-            label = { Text("Reels") },
+            label = { Text(LocalizedStrings.get("reels", currentLanguage)) },
             modifier = Modifier.testTag("nav_reels"),
             colors = navColors
         )
@@ -108,7 +111,7 @@ fun AuraBottomNavigation(
                     contentDescription = "Profile"
                 )
             },
-            label = { Text("Profile") },
+            label = { Text(LocalizedStrings.get("profile", currentLanguage)) },
             modifier = Modifier.testTag("nav_profile"),
             colors = navColors
         )

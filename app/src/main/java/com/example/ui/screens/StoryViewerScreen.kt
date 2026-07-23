@@ -88,8 +88,20 @@ fun StoryViewerScreen(
             .testTag("story_viewer_screen")
     ) {
         // Story Media
+        val storyPath = currentStory.mediaUrl
+        val storyModel = remember(storyPath) {
+            when {
+                storyPath.startsWith("content://") -> android.net.Uri.parse(storyPath)
+                storyPath.startsWith("/") -> java.io.File(storyPath)
+                else -> storyPath
+            }
+        }
         AsyncImage(
-            model = currentStory.mediaUrl,
+            model = coil.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
+                .data(storyModel)
+                .crossfade(true)
+                .error(android.R.drawable.ic_menu_gallery)
+                .build(),
             contentDescription = "Story media",
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()

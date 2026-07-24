@@ -1,6 +1,10 @@
 package com.example.ui.components
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -13,7 +17,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,15 +37,18 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -63,55 +69,57 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import com.example.data.remote.LiveKitCallManager
 import com.example.ui.CallState
 import com.example.ui.theme.AuraPink
 import com.example.ui.theme.AuraPurple
 import com.example.ui.theme.DarkBackground
-import kotlinx.coroutines.delay
+import io.livekit.android.renderer.TextureViewRenderer
+import io.livekit.android.room.track.VideoTrack
 
 @Composable
 fun CallOverlayModal(
     callState: CallState,
+    liveKitManager: LiveKitCallManager,
+    onAcceptCall: () -> Unit,
+    onDeclineCall: () -> Unit,
+    onCancelCall: () -> Unit,
     onEndCall: () -> Unit,
     onToggleMute: () -> Unit,
     onToggleCamera: () -> Unit
 ) {
     if (!callState.isActive) return
 
-    var callDurationSeconds by remember { mutableIntStateOf(0) }
-    var isConnected by remember { mutableStateOf(false) }
-    var callStatusText by remember { mutableStateOf("Calling...") }
+    val context = LocalContext.current
 
-    // Ringing -> Auto answer sequence
-    LaunchedEffect(callState.isActive) {
-        if (callState.isActive) {
-            isConnected = false
-            callDurationSeconds = 0
-            callStatusText = "Calling @${callState.peerUsername}..."
-            delay(1500)
-            if (!isConnected) {
-                callStatusText = "Ringing... 🔔"
-            }
-            delay(3000)
-            if (!isConnected) {
-                isConnected = true
-                callStatusText = "Connected"
-            }
+    // Permission check
+    var hasPermissions by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&
+                    (!callState.isVideo || ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+        )
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        hasPermissions = perms[Manifest.permission.RECORD_AUDIO] == true &&
+                (!callState.isVideo || perms[Manifest.permission.CAMERA] == true)
+    }
+
+    LaunchedEffect(callState.isActive, callState.isVideo) {
+        if (!hasPermissions) {
+            val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
+            if (callState.isVideo) needed.add(Manifest.permission.CAMERA)
+            permissionLauncher.launch(needed.toTypedArray())
         }
     }
 
-    // Call duration timer once connected
-    LaunchedEffect(isConnected) {
-        if (isConnected) {
-            while (callState.isActive && isConnected) {
-                delay(1000)
-                callDurationSeconds++
-            }
-        }
-    }
+    val remoteVideoTrack by liveKitManager.remoteVideoTrack.collectAsState()
+    val isLiveKitConnected by liveKitManager.isConnected.collectAsState()
 
-    val minutes = callDurationSeconds / 60
-    val seconds = callDurationSeconds % 60
+    val minutes = callState.callDurationSeconds / 60
+    val seconds = callState.callDurationSeconds % 60
     val formattedDuration = String.format("%02d:%02d", minutes, seconds)
 
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -138,21 +146,29 @@ fun CallOverlayModal(
                     .fillMaxSize()
                     .testTag("call_overlay_dialog")
             ) {
-                if (callState.isVideo && callState.isCameraOn && isConnected) {
-                    // Peer video stream backdrop
-                    AsyncImage(
-                        model = callState.peerAvatar,
-                        contentDescription = "Peer video stream",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.4f))
-                    )
+                // Video Backdrop when connected
+                if (callState.isVideo && callState.isCameraOn && callState.status == "connected") {
+                    if (remoteVideoTrack != null) {
+                        LiveKitVideoView(
+                            videoTrack = remoteVideoTrack,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        // Remote avatar placeholder while remote track initializes
+                        AsyncImage(
+                            model = callState.peerAvatar,
+                            contentDescription = "Peer video stream",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.5f))
+                        )
+                    }
 
-                    // Self PIP camera view box in top corner with live CameraX preview
+                    // Self PIP camera view box in top corner
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopEnd)
@@ -162,9 +178,7 @@ fun CallOverlayModal(
                             .border(2.dp, AuraPink, RoundedCornerShape(16.dp))
                             .background(Color.DarkGray)
                     ) {
-                        LiveCameraPreview(
-                            modifier = Modifier.fillMaxSize()
-                        )
+                        LiveCameraPreview(modifier = Modifier.fillMaxSize())
 
                         Box(
                             modifier = Modifier
@@ -179,161 +193,254 @@ fun CallOverlayModal(
                     }
                 }
 
-                // Call Header
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 70.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        if (!isConnected) {
-                            Box(
-                                modifier = Modifier
-                                    .size(140.dp)
-                                    .scale(pulseScale)
-                                    .clip(CircleShape)
-                                    .background(AuraPink.copy(alpha = 0.25f))
-                            )
-                        }
-                        AsyncImage(
-                            model = callState.peerAvatar,
-                            contentDescription = callState.peerUsername,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(110.dp)
-                                .clip(CircleShape)
-                                .border(3.dp, AuraPink, CircleShape)
+                // If missing permissions, show permission prompt banner
+                if (!hasPermissions) {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            "Microphone and Camera permissions are required to start the LiveKit call.",
+                            style = MaterialTheme.typography.bodyLarge.copy(color = Color.White),
+                            modifier = Modifier.padding(bottom = 16.dp)
                         )
-                    }
-
-                    Spacer(modifier = Modifier.height(18.dp))
-
-                    Text(
-                        text = "@${callState.peerUsername}",
-                        style = MaterialTheme.typography.headlineMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Text(
-                        text = if (!isConnected) callStatusText else if (callState.isVideo) "Aura Video Call • $formattedDuration" else "Aura Voice Call • $formattedDuration",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            color = if (isConnected) Color(0xFF4ADE80) else AuraPink,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    )
-
-                    // Quick option to answer immediately if ringing
-                    if (!isConnected) {
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(20.dp))
-                                .background(Color(0xFF22C55E))
-                                .clickable {
-                                    isConnected = true
-                                }
-                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        Button(
+                            onClick = {
+                                val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                                if (callState.isVideo) needed.add(Manifest.permission.CAMERA)
+                                permissionLauncher.launch(needed.toTypedArray())
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AuraPink)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.Call, contentDescription = "Accept", tint = Color.White, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "Simulate Answer by @${callState.peerUsername}",
-                                    style = MaterialTheme.typography.labelMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
-                                )
-                            }
+                            Text("Grant Permissions", color = Color.White)
                         }
                     }
-
-                    // Audio spectrum wave bars for voice calls when connected
-                    if (!callState.isVideo && isConnected) {
-                        Spacer(modifier = Modifier.height(24.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            repeat(16) { i ->
-                                val heightFactor = (i % 5 + 1) * 0.2f * pulseScale
+                } else {
+                    // Header Area
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 70.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            if (callState.status == "ringing" || callState.status == "initiating") {
                                 Box(
                                     modifier = Modifier
-                                        .width(4.dp)
-                                        .height((32 * heightFactor).dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(if (i % 2 == 0) AuraPink else AuraPurple)
+                                        .size(140.dp)
+                                        .scale(pulseScale)
+                                        .clip(CircleShape)
+                                        .background(AuraPink.copy(alpha = 0.25f))
                                 )
+                            }
+                            AsyncImage(
+                                model = callState.peerAvatar,
+                                contentDescription = callState.peerUsername,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(110.dp)
+                                    .clip(CircleShape)
+                                    .border(3.dp, AuraPink, CircleShape)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(18.dp))
+
+                        Text(
+                            text = "@${callState.peerUsername}",
+                            style = MaterialTheme.typography.headlineMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        val statusText = when (callState.status) {
+                            "initiating" -> "Initiating Call..."
+                            "ringing" -> if (callState.isIncoming) "Incoming ${if (callState.isVideo) "Video" else "Audio"} Call..." else "Ringing @${callState.peerUsername}..."
+                            "connecting" -> "Connecting to LiveKit room..."
+                            "connected" -> if (callState.isVideo) "Aura Video Call • $formattedDuration" else "Aura Voice Call • $formattedDuration"
+                            "declined" -> "Call Declined"
+                            "cancelled" -> "Call Cancelled"
+                            "failed" -> callState.errorMessage ?: "Connection Failed"
+                            else -> callState.status
+                        }
+
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                color = if (callState.status == "connected") Color(0xFF4ADE80) else AuraPink,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        )
+
+                        // Audio spectrum wave bars for voice calls when connected
+                        if (!callState.isVideo && callState.status == "connected") {
+                            Spacer(modifier = Modifier.height(24.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                repeat(16) { i ->
+                                    val heightFactor = (i % 5 + 1) * 0.2f * pulseScale
+                                    Box(
+                                        modifier = Modifier
+                                            .width(4.dp)
+                                            .height((32 * heightFactor).dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(if (i % 2 == 0) AuraPink else AuraPurple)
+                                    )
+                                }
                             }
                         }
                     }
-                }
 
-                // Control Bar
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .padding(bottom = 60.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Mute Button
-                    IconButton(
-                        onClick = onToggleMute,
+                    // Control Bar
+                    Box(
                         modifier = Modifier
-                            .size(58.dp)
-                            .clip(CircleShape)
-                            .background(if (callState.isMuted) AuraPink else Color.White.copy(alpha = 0.2f))
-                            .testTag("call_mute_button")
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(bottom = 60.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            imageVector = if (callState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
-                            contentDescription = "Mute",
-                            tint = Color.White
-                        )
-                    }
+                        if (callState.isIncoming && callState.status == "ringing") {
+                            // Incoming call actions: Accept & Decline
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Decline Button
+                                IconButton(
+                                    onClick = onDeclineCall,
+                                    modifier = Modifier
+                                        .size(68.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFEF4444))
+                                        .testTag("call_decline_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CallEnd,
+                                        contentDescription = "Decline",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                }
 
-                    // End Call Button
-                    IconButton(
-                        onClick = onEndCall,
-                        modifier = Modifier
-                            .size(72.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFFEF4444))
-                            .testTag("call_end_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CallEnd,
-                            contentDescription = "End Call",
-                            tint = Color.White,
-                            modifier = Modifier.size(34.dp)
-                        )
-                    }
+                                // Accept Button
+                                IconButton(
+                                    onClick = onAcceptCall,
+                                    modifier = Modifier
+                                        .size(68.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF22C55E))
+                                        .testTag("call_accept_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Call,
+                                        contentDescription = "Accept",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                }
+                            }
+                        } else {
+                            // Ongoing call actions
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Mute Button
+                                IconButton(
+                                    onClick = onToggleMute,
+                                    modifier = Modifier
+                                        .size(58.dp)
+                                        .clip(CircleShape)
+                                        .background(if (callState.isMuted) AuraPink else Color.White.copy(alpha = 0.2f))
+                                        .testTag("call_mute_button")
+                                ) {
+                                    Icon(
+                                        imageVector = if (callState.isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                                        contentDescription = "Mute",
+                                        tint = Color.White
+                                    )
+                                }
 
-                    // Camera Toggle Button for Video Call
-                    if (callState.isVideo) {
-                        IconButton(
-                            onClick = onToggleCamera,
-                            modifier = Modifier
-                                .size(58.dp)
-                                .clip(CircleShape)
-                                .background(if (!callState.isCameraOn) AuraPink else Color.White.copy(alpha = 0.2f))
-                                .testTag("call_camera_button")
-                        ) {
-                            Icon(
-                                imageVector = if (callState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
-                                contentDescription = "Camera",
-                                tint = Color.White
-                            )
+                                // End / Cancel Call Button
+                                IconButton(
+                                    onClick = {
+                                        if (callState.status == "ringing" || callState.status == "initiating") {
+                                            onCancelCall()
+                                        } else {
+                                            onEndCall()
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .size(72.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFEF4444))
+                                        .testTag("call_end_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CallEnd,
+                                        contentDescription = "End Call",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(34.dp)
+                                    )
+                                }
+
+                                // Camera Toggle Button for Video Call
+                                if (callState.isVideo) {
+                                    IconButton(
+                                        onClick = onToggleCamera,
+                                        modifier = Modifier
+                                            .size(58.dp)
+                                            .clip(CircleShape)
+                                            .background(if (!callState.isCameraOn) AuraPink else Color.White.copy(alpha = 0.2f))
+                                            .testTag("call_camera_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = if (callState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                                            contentDescription = "Camera",
+                                            tint = Color.White
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+fun LiveKitVideoView(
+    videoTrack: VideoTrack?,
+    modifier: Modifier = Modifier
+) {
+    if (videoTrack == null) return
+
+    AndroidView(
+        factory = { ctx ->
+            TextureViewRenderer(ctx).apply {
+                videoTrack.addRenderer(this)
+            }
+        },
+        update = { renderer ->
+            videoTrack.addRenderer(renderer)
+        },
+        onRelease = { renderer ->
+            videoTrack.removeRenderer(renderer)
+            renderer.release()
+        },
+        modifier = modifier
+    )
 }
 
 @Composable

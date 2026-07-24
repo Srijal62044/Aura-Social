@@ -50,11 +50,13 @@ import com.example.ui.theme.AuraPink
 @Composable
 fun DirectMessagesScreen(
     users: List<UserEntity>,
+    unreadCounts: Map<String, Int> = emptyMap(),
     onBackClick: () -> Unit,
     onOpenChat: (String) -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(0) } // 0: Primary, 1: General, 2: Requests
-    val tabs = listOf("Primary", "General", "Requests (1)")
+    val totalUnread = unreadCounts.values.sum()
+    val tabs = listOf("Primary${if (totalUnread > 0) " ($totalUnread)" else ""}", "General", "Requests")
 
     Box(
         modifier = Modifier
@@ -104,6 +106,7 @@ fun DirectMessagesScreen(
             // Conversation List
             LazyColumn(modifier = Modifier.fillMaxSize()) {
                 items(users, key = { it.username }) { user ->
+                    val unread = unreadCounts[user.username] ?: 0
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -112,28 +115,60 @@ fun DirectMessagesScreen(
                             .testTag("chat_item_${user.username}"),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        AsyncImage(
-                            model = user.avatarUrl,
-                            contentDescription = user.username,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(56.dp)
-                                .clip(CircleShape)
-                        )
+                        Box {
+                            AsyncImage(
+                                model = user.avatarUrl,
+                                contentDescription = user.username,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(CircleShape)
+                            )
+                            if (unread > 0) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(AuraPink)
+                                        .align(Alignment.TopEnd)
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = user.fullName,
-                                style = MaterialTheme.typography.titleMedium.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = user.fullName.ifBlank { user.username },
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = if (unread > 0) FontWeight.ExtraBold else FontWeight.Bold,
+                                        fontSize = 15.sp
+                                    )
                                 )
-                            )
+                                if (unread > 0) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(AuraPink)
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = "$unread NEW",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 9.sp
+                                            )
+                                        )
+                                    }
+                                }
+                            }
                             Text(
-                                text = "Active now • Tap to chat",
+                                text = if (unread > 0) "• $unread unread message${if (unread > 1) "s" else ""}" else "Active now • Tap to chat",
                                 style = MaterialTheme.typography.bodyMedium.copy(
                                     fontSize = 12.sp,
-                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                    fontWeight = if (unread > 0) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (unread > 0) AuraPink else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                                 ),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -144,7 +179,7 @@ fun DirectMessagesScreen(
                             Icon(
                                 imageVector = Icons.Default.CameraAlt,
                                 contentDescription = "Quick Photo Message",
-                                tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                tint = if (unread > 0) AuraPink else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                             )
                         }
                     }

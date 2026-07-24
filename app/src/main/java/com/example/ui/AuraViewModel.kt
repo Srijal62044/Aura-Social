@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.AppDatabase
@@ -18,6 +19,9 @@ import com.example.data.local.StoryHighlightEntity
 import com.example.data.local.UserEntity
 import com.example.data.repository.AuraRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -203,17 +207,28 @@ enum class AuthState {
 
 data class CallState(
     val isActive: Boolean = false,
-    val isVideo: Boolean = true,
+    val callId: String = "",
+    val roomName: String = "",
+    val callerId: String = "",
+    val receiverId: String = "",
     val peerUsername: String = "",
     val peerAvatar: String = "",
+    val isVideo: Boolean = true,
+    val status: String = "idle", // "idle", "initiating", "ringing", "accepted", "connecting", "connected", "declined", "cancelled", "missed", "ended", "failed"
+    val isIncoming: Boolean = false,
     val isMuted: Boolean = false,
-    val isCameraOn: Boolean = true
+    val isCameraOn: Boolean = true,
+    val errorMessage: String? = null,
+    val callDurationSeconds: Int = 0
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: AuraRepository
     private val sessionManager = SessionManager(application)
+    val liveKitManager = com.example.data.remote.LiveKitCallManager()
+    private var callJob: kotlinx.coroutines.Job? = null
+    private var durationJob: kotlinx.coroutines.Job? = null
 
     // AUTH STATE
     private val _authState = MutableStateFlow(AuthState.LOGIN)
@@ -228,23 +243,37 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentUsername = MutableStateFlow("")
     val currentUsername: StateFlow<String> = _currentUsername.asStateFlow()
 
+    private val _currentUser = MutableStateFlow<UserEntity?>(null)
+
     init {
         val dao = AppDatabase.getDatabase(application).auraDao()
         repository = AuraRepository(dao, application)
 
-        val savedUser = sessionManager.getSessionUsername()
-        if (!savedUser.isNullOrBlank()) {
+        val savedUserId = sessionManager.getSessionUserId()
+        val savedToken = sessionManager.getSessionToken()
+        if (!savedUserId.isNullOrBlank() && !savedToken.isNullOrBlank()) {
             viewModelScope.launch {
-                val dbUser = repository.getUserDirect(savedUser)
-                if (dbUser != null) {
-                    _currentUsername.value = dbUser.username
+                _authLoading.value = true
+                repository.setSession(savedUserId, savedToken)
+                val refreshedProfile = repository.refreshCurrentProfile(savedUserId, savedToken)
+                _authLoading.value = false
+                if (refreshedProfile != null) {
+                    val profileUsername = refreshedProfile.username
+                    sessionManager.saveSession(savedUserId, savedToken, profileUsername)
+                    _currentUsername.value = profileUsername
+                    _currentUser.value = refreshedProfile
                     _authState.value = AuthState.LOGGED_IN
                 } else {
                     sessionManager.clearSession()
+                    _currentUser.value = null
+                    _currentUsername.value = ""
                     _authState.value = AuthState.LOGIN
                 }
             }
         } else {
+            sessionManager.clearSession()
+            _currentUser.value = null
+            _currentUsername.value = ""
             _authState.value = AuthState.LOGIN
         }
 
@@ -259,19 +288,75 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+
+        // Periodic polling loop for profile and online status updates in realtime
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(5000)
+                val current = _currentUsername.value
+                if (current.isNotBlank()) {
+                    repository.fetchUsers(current)
+                    val latestMe = repository.getUserDirect(current)
+                    if (latestMe != null) {
+                        _currentUser.value = latestMe
+                    }
+                }
+            }
+        }
+
+        // Periodic check for incoming calls and active call updates
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(1200)
+                val current = _currentUsername.value
+                if (current.isNotBlank()) {
+                    val activeState = _callState.value
+                    if (!activeState.isActive) {
+                        val callerProfile = currentUser.value ?: repository.getUserDirect(current)
+                        var callerUuid = callerProfile?.id.orEmpty()
+                        if (callerUuid.isBlank()) {
+                            callerUuid = repository.getCurrentUserAuthId().orEmpty()
+                        }
+                        if (callerUuid.isNotBlank()) {
+                            val pendingCall = repository.getPendingIncomingCall(callerUuid)
+                            if (pendingCall != null && pendingCall.status == "ringing") {
+                                val callerUser = repository.getUserByUuid(pendingCall.callerId)
+                                val peerName = callerUser?.username ?: "Caller"
+                                _callState.value = CallState(
+                                    isActive = true,
+                                    callId = pendingCall.id,
+                                    roomName = pendingCall.roomName,
+                                    callerId = pendingCall.callerId,
+                                    receiverId = callerUuid,
+                                    peerUsername = peerName,
+                                    peerAvatar = callerUser?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
+                                    isVideo = pendingCall.callType == "video",
+                                    status = "ringing",
+                                    isIncoming = true
+                                )
+                                observeActiveCallStatus(pendingCall.id)
+                            }
+                        }
+                    } else if (activeState.status == "connecting" && liveKitManager.isConnected.value) {
+                        _callState.value = activeState.copy(status = "connected")
+                        startDurationTimer()
+                    }
+                }
+            }
+        }
     }
 
-    val currentUser: StateFlow<UserEntity?> = combine(_currentUsername, repository.getAllUsers()) { username, users ->
+    val currentUser: StateFlow<UserEntity?> = combine(_currentUsername, repository.getAllUsers(), _currentUser) { username, users, directUser ->
         if (username.isBlank()) {
             null
         } else {
-            users.find { it.username.equals(username, ignoreCase = true) }
-                ?: UserEntity(
-                    username = username,
-                    fullName = username,
-                    email = "",
-                    avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
-                )
+            val fromList = users.find { it.username.equals(username, ignoreCase = true) }
+            fromList ?: directUser ?: UserEntity(
+                username = username,
+                fullName = username,
+                email = "",
+                avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+            )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
@@ -351,7 +436,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
         _selectedUsername.value = username
         viewModelScope.launch {
-            val profile = repository.getUserDirect(username)
+            val current = _currentUsername.value
+            val profile = repository.getUserDirect(username, current)
                 ?: UserEntity(
                     username = username,
                     fullName = username,
@@ -467,9 +553,26 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // DIRECT MESSAGES & CALLS
+    // DIRECT MESSAGES & UNREAD COUNTS
     private val _selectedConversationId = MutableStateFlow<String?>(null)
     val selectedConversationId: StateFlow<String?> = _selectedConversationId.asStateFlow()
+
+    private val _unreadCountsPerConversation = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val unreadCountsPerConversation: StateFlow<Map<String, Int>> = _unreadCountsPerConversation.asStateFlow()
+
+    val totalUnreadMessagesCount: StateFlow<Int> = _unreadCountsPerConversation.map { map ->
+        map.values.sum()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    private val _isPeerTyping = MutableStateFlow(false)
+    val isPeerTyping: StateFlow<Boolean> = _isPeerTyping.asStateFlow()
+
+    private val _typingPeerUsername = MutableStateFlow<String?>(null)
+    val typingPeerUsername: StateFlow<String?> = _typingPeerUsername.asStateFlow()
+
+    private var messagePollingJob: Job? = null
+    private var typingPollingJob: Job? = null
+    private var typingDebounceJob: Job? = null
 
     val activeMessages: StateFlow<List<MessageEntity>> = _selectedConversationId.flatMapLatest { convId ->
         if (convId.isNullOrEmpty()) flowOf(emptyList())
@@ -477,19 +580,89 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     fun openChat(username: String) {
+        val current = _currentUsername.value
         _selectedConversationId.value = username
         _currentScreen.value = AuraScreen.CHAT_DETAIL
+
+        messagePollingJob?.cancel()
+        typingPollingJob?.cancel()
+
         viewModelScope.launch {
-            repository.fetchMessages(_currentUsername.value, username)
+            if (current.isNotBlank()) {
+                repository.markMessagesAsRead(current, username)
+                repository.fetchMessages(current, username)
+                val newCounts = repository.getUnreadCounts(current)
+                _unreadCountsPerConversation.value = newCounts
+            }
+        }
+
+        // Active conversation realtime message sync loop
+        messagePollingJob = viewModelScope.launch {
+            while (isActive && _selectedConversationId.value == username) {
+                delay(1200)
+                val curr = _currentUsername.value
+                if (curr.isNotBlank()) {
+                    repository.fetchMessages(curr, username)
+                    repository.markMessagesAsRead(curr, username)
+                }
+            }
+        }
+
+        // Active typing indicator listener loop
+        typingPollingJob = viewModelScope.launch {
+            while (isActive && _selectedConversationId.value == username) {
+                delay(1000)
+                val curr = _currentUsername.value
+                if (curr.isNotBlank()) {
+                    val activeTyping = repository.getTypingUsers(username, curr)
+                    _isPeerTyping.value = activeTyping.isNotEmpty()
+                    _typingPeerUsername.value = activeTyping.firstOrNull()
+                }
+            }
+        }
+    }
+
+    fun closeChat() {
+        messagePollingJob?.cancel()
+        typingPollingJob?.cancel()
+        val activePeer = _selectedConversationId.value
+        val current = _currentUsername.value
+        if (!activePeer.isNullOrBlank() && current.isNotBlank()) {
+            viewModelScope.launch {
+                repository.sendTypingStatus(activePeer, current, false)
+            }
+        }
+        _selectedConversationId.value = null
+        _isPeerTyping.value = false
+        _typingPeerUsername.value = null
+    }
+
+    fun onUserTyping() {
+        val recipient = _selectedConversationId.value ?: return
+        val current = _currentUsername.value
+        if (recipient.isBlank() || current.isBlank()) return
+
+        typingDebounceJob?.cancel()
+        viewModelScope.launch {
+            repository.sendTypingStatus(recipient, current, true)
+        }
+
+        typingDebounceJob = viewModelScope.launch {
+            delay(2000)
+            repository.sendTypingStatus(recipient, current, false)
         }
     }
 
     fun sendMessage(text: String, mediaUrl: String = "", type: String = "text") {
         val recipient = _selectedConversationId.value ?: return
         if (text.isBlank() && mediaUrl.isBlank()) return
+        val sender = _currentUsername.value
+        val user = currentUser.value
+
+        // Cancel typing status immediately on send
+        typingDebounceJob?.cancel()
         viewModelScope.launch {
-            val sender = _currentUsername.value
-            val user = currentUser.value
+            repository.sendTypingStatus(recipient, sender, false)
             repository.sendMessage(
                 MessageEntity(
                     conversationId = recipient,
@@ -500,9 +673,11 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     mediaUrl = mediaUrl,
                     type = type,
                     isMine = true,
+                    status = "sending",
                     timestamp = "Just now"
                 )
             )
+            repository.fetchMessages(sender, recipient)
         }
     }
 
@@ -512,36 +687,199 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // CALL STATE
+    // CALL STATE & LIVEKIT FLOW
     private val _callState = MutableStateFlow(CallState())
     val callState: StateFlow<CallState> = _callState.asStateFlow()
 
-    fun startCall(isVideo: Boolean) {
-        val peer = _selectedConversationId.value ?: "User"
+    fun startCall(isVideo: Boolean, targetPeer: String? = null) {
+        val peerUsername = targetPeer ?: _selectedConversationId.value ?: return
+        val currentUsername = _currentUsername.value
+        if (currentUsername.isBlank() || peerUsername.isBlank()) return
+
         viewModelScope.launch {
-            val peerUser = repository.getUserDirect(peer)
+            val callerProfile = currentUser.value ?: repository.getUserDirect(currentUsername)
+            var callerUuid = callerProfile?.id.orEmpty()
+            if (callerUuid.isBlank()) {
+                callerUuid = repository.getCurrentUserAuthId().orEmpty()
+            }
+
+            val receiverProfile = repository.getUserDirect(peerUsername)
+            val receiverUuid = receiverProfile?.id.orEmpty()
+
+            Log.d("AuraCall", "startCall: callerUuid=$callerUuid, receiverUuid=$receiverUuid")
+
+            if (callerUuid.isBlank()) {
+                val msg = "Please sign in again."
+                _callState.value = CallState(
+                    isActive = true,
+                    status = "failed",
+                    errorMessage = msg
+                )
+                return@launch
+            }
+
+            if (receiverUuid.isBlank()) {
+                val msg = "Unable to locate receiver profile ID."
+                _callState.value = CallState(
+                    isActive = true,
+                    status = "failed",
+                    errorMessage = msg
+                )
+                return@launch
+            }
+
+            val callId = java.util.UUID.randomUUID().toString()
+            val roomName = "call_${callId.take(8)}"
+
             _callState.value = CallState(
                 isActive = true,
+                callId = callId,
+                roomName = roomName,
+                callerId = callerUuid,
+                receiverId = receiverUuid,
+                peerUsername = peerUsername,
+                peerAvatar = receiverProfile?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
                 isVideo = isVideo,
-                peerUsername = peer,
-                peerAvatar = peerUser?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+                status = "initiating",
+                isIncoming = false
             )
-            val appId = try { com.example.BuildConfig.AGORA_APP_ID } catch (e: Exception) { "9ce58239a9b7417b8e2cf0e16bd4926f" }
-            android.util.Log.d("AuraCall", "Starting RTC Call session with Agora App ID: $appId channel: ${_currentUsername.value}_$peer")
-            showFeedback(if (isVideo) "Connecting video call with @$peer..." else "Connecting voice call with @$peer...")
+
+            val (created, errorMsg) = repository.createCallRecordEx(
+                callerUuid = callerUuid,
+                receiverUuid = receiverUuid,
+                roomId = roomName,
+                callType = if (isVideo) "video" else "audio"
+            )
+
+            if (created) {
+                _callState.value = _callState.value.copy(status = "ringing")
+                observeActiveCallStatus(callId)
+            } else {
+                _callState.value = _callState.value.copy(status = "failed", errorMessage = errorMsg)
+            }
+        }
+    }
+
+    fun acceptCall(context: android.content.Context) {
+        val state = _callState.value
+        if (!state.isActive || state.callId.isBlank()) return
+
+        viewModelScope.launch {
+            _callState.value = state.copy(status = "connecting")
+            repository.updateCallStatus(state.callId, "accepted")
+            connectToLiveKit(context, state.roomName, state.isVideo)
+        }
+    }
+
+    fun declineCall() {
+        val state = _callState.value
+        if (state.callId.isNotBlank()) {
+            viewModelScope.launch {
+                repository.updateCallStatus(state.callId, "declined")
+                cleanupCall()
+            }
+        } else {
+            cleanupCall()
+        }
+    }
+
+    fun cancelCall() {
+        val state = _callState.value
+        if (state.callId.isNotBlank()) {
+            viewModelScope.launch {
+                repository.updateCallStatus(state.callId, "cancelled")
+                cleanupCall()
+            }
+        } else {
+            cleanupCall()
         }
     }
 
     fun endCall() {
+        val state = _callState.value
+        if (state.callId.isNotBlank()) {
+            viewModelScope.launch {
+                repository.updateCallStatus(state.callId, "ended")
+                cleanupCall()
+            }
+        } else {
+            cleanupCall()
+        }
+    }
+
+    fun connectToLiveKit(context: android.content.Context, roomName: String, isVideo: Boolean) {
+        val current = _currentUsername.value
+        viewModelScope.launch {
+            val token = repository.fetchLiveKitToken(roomName, current) ?: "token_${roomName}_${current}"
+            liveKitManager.connect(context, liveKitManager.livekitUrl, token, isVideo)
+        }
+    }
+
+    private fun observeActiveCallStatus(callId: String) {
+        callJob?.cancel()
+        callJob = viewModelScope.launch {
+            while (_callState.value.isActive && _callState.value.callId == callId) {
+                kotlinx.coroutines.delay(1000)
+                val record = repository.getCallRecord(callId) ?: continue
+                val currentState = _callState.value
+
+                when (record.status) {
+                    "accepted" -> {
+                        if (currentState.status == "ringing" || currentState.status == "initiating") {
+                            _callState.value = currentState.copy(status = "connecting")
+                            if (!currentState.isIncoming) {
+                                connectToLiveKit(getApplication(), record.roomName, currentState.isVideo)
+                            }
+                        }
+                    }
+                    "declined" -> {
+                        _callState.value = currentState.copy(status = "declined", errorMessage = "Call declined.")
+                        kotlinx.coroutines.delay(2000)
+                        cleanupCall()
+                    }
+                    "cancelled" -> {
+                        _callState.value = currentState.copy(status = "cancelled", errorMessage = "Call cancelled.")
+                        kotlinx.coroutines.delay(2000)
+                        cleanupCall()
+                    }
+                    "ended" -> {
+                        _callState.value = currentState.copy(status = "ended")
+                        cleanupCall()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startDurationTimer() {
+        durationJob?.cancel()
+        durationJob = viewModelScope.launch {
+            var secs = 0
+            while (_callState.value.status == "connected") {
+                kotlinx.coroutines.delay(1000)
+                secs++
+                _callState.value = _callState.value.copy(callDurationSeconds = secs)
+            }
+        }
+    }
+
+    private fun cleanupCall() {
+        callJob?.cancel()
+        durationJob?.cancel()
+        liveKitManager.disconnect()
         _callState.value = CallState(isActive = false)
     }
 
     fun toggleMute() {
-        _callState.value = _callState.value.copy(isMuted = !_callState.value.isMuted)
+        val newMute = !_callState.value.isMuted
+        _callState.value = _callState.value.copy(isMuted = newMute)
+        liveKitManager.toggleMute(newMute)
     }
 
     fun toggleCamera() {
-        _callState.value = _callState.value.copy(isCameraOn = !_callState.value.isCameraOn)
+        val newCam = !_callState.value.isCameraOn
+        _callState.value = _callState.value.copy(isCameraOn = newCam)
+        liveKitManager.toggleCamera(!newCam)
     }
 
     // SEARCH
@@ -735,7 +1073,8 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun acceptFollowRequest(actorUsername: String) {
         viewModelScope.launch {
-            repository.acceptFollowRequest(actorUsername)
+            val current = _currentUsername.value
+            repository.acceptFollowRequest(actorUsername, current)
             showFeedback("Accepted follow request from @$actorUsername")
         }
     }
@@ -835,8 +1174,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             val (user, msg) = repository.loginUser(identifier, p)
             _authLoading.value = false
             if (user != null) {
-                sessionManager.saveSession(user.username)
+                val token = repository.getUserToken() ?: ""
+                sessionManager.saveSession(user.id, token, user.username)
                 _currentUsername.value = user.username
+                _currentUser.value = user
                 _authState.value = AuthState.LOGGED_IN
                 _currentScreen.value = AuraScreen.HOME
                 showFeedback("Welcome back, ${user.fullName}!")
@@ -844,6 +1185,32 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 _authError.value = msg
             }
         }
+    }
+
+    fun loginWithGoogleToken(accessToken: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            val (user, msg) = repository.loginWithToken(accessToken)
+            _authLoading.value = false
+            if (user != null) {
+                val token = repository.getUserToken() ?: ""
+                sessionManager.saveSession(user.id, token, user.username)
+                _currentUsername.value = user.username
+                _currentUser.value = user
+                _authState.value = AuthState.LOGGED_IN
+                _currentScreen.value = AuraScreen.HOME
+                showFeedback("Welcome back, ${user.fullName}!")
+            } else {
+                _authError.value = msg
+                showFeedback("Google Sign-In failed: $msg")
+            }
+        }
+    }
+
+    fun getGoogleOAuthUrl(): String {
+        val baseUrl = repository.supabase.baseUrl
+        return "$baseUrl/auth/v1/authorize?provider=google&redirect_to=aurasocial://login-callback"
     }
 
     fun register(name: String, u: String, e: String, p: String) {
@@ -861,14 +1228,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 followingCount = 0,
                 postCount = 0
             )
-            val (success, msg) = repository.registerUser(newUser)
+            val (registeredUser, msg) = repository.registerUser(newUser)
             _authLoading.value = false
-            if (success) {
-                sessionManager.saveSession(cleanUsername)
-                _currentUsername.value = cleanUsername
+            if (registeredUser != null) {
+                val token = repository.getUserToken() ?: ""
+                sessionManager.saveSession(registeredUser.id, token, registeredUser.username)
+                _currentUsername.value = registeredUser.username
+                _currentUser.value = registeredUser
                 _authState.value = AuthState.LOGGED_IN
                 _currentScreen.value = AuraScreen.HOME
-                showFeedback("Account created! Welcome to Aura, ${newUser.fullName}.")
+                showFeedback("Account created! Welcome to Aura, ${registeredUser.fullName}.")
             } else {
                 _authError.value = msg
             }
@@ -893,6 +1262,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun logout() {
         sessionManager.clearSession()
         _currentUsername.value = ""
+        _currentUser.value = null
         _authState.value = AuthState.LOGIN
         showFeedback("Logged out successfully")
     }

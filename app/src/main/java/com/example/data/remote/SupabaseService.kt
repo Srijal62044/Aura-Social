@@ -27,6 +27,11 @@ class SupabaseService {
 
     private val TAG = "AuraSupabase"
 
+    @Volatile
+    var currentAuthUserId: String? = null
+    @Volatile
+    var currentUserToken: String? = null
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -46,9 +51,10 @@ class SupabaseService {
         }
 
     private fun getHeaders(userToken: String? = null): Map<String, String> {
+        val token = if (!userToken.isNullOrBlank()) userToken else if (!currentUserToken.isNullOrBlank()) currentUserToken else apiKey
         return mapOf(
             "apikey" to apiKey,
-            "Authorization" to "Bearer ${if (!userToken.isNullOrBlank()) userToken else apiKey}",
+            "Authorization" to "Bearer $token",
             "Content-Type" to "application/json",
             "Prefer" to "return=representation"
         )
@@ -56,7 +62,7 @@ class SupabaseService {
 
     // --- AUTHENTICATION ---
 
-    suspend fun signUp(email: String, password: String, username: String, fullName: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+    suspend fun signUp(email: String, password: String, username: String, fullName: String): Pair<UserEntity?, String> = withContext(Dispatchers.IO) {
         try {
             val authUrl = "$baseUrl/auth/v1/signup"
             val bodyJson = JSONObject().apply {
@@ -79,26 +85,34 @@ class SupabaseService {
 
             if (response.isSuccessful) {
                 val json = JSONObject(respString)
+                val token = json.optString("access_token")
                 val userObj = json.optJSONObject("user")
-                val userId = userObj?.optString("id") ?: UUID.randomUUID().toString()
+                val userId = userObj?.optString("id") ?: ""
+                if (!token.isNullOrBlank()) currentUserToken = token
+                if (!userId.isNullOrBlank()) currentAuthUserId = userId
 
-                val profile = UserEntity(
+                val profileToUpsert = UserEntity(
+                    id = userId,
                     username = username.lowercase().trim(),
                     fullName = fullName.trim(),
                     email = email.lowercase().trim(),
                     password = password,
                     avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
                 )
-                upsertProfile(profile, userId)
-                Pair(true, "Account created successfully!")
+                upsertProfile(profileToUpsert, userId)
+
+                // Wait for profile trigger and refetch the profile with a short retry mechanism
+                val profile = getProfileByUuidWithRetry(userId, maxRetries = 10, delayMs = 1000) ?: profileToUpsert
+
+                Pair(profile, "Account created successfully!")
             } else {
                 val json = try { JSONObject(respString) } catch (e: Exception) { null }
                 val errorMsg = json?.optString("msg") ?: json?.optString("error_description") ?: json?.optString("message") ?: "Sign up failed."
-                Pair(false, errorMsg)
+                Pair(null, errorMsg)
             }
         } catch (e: Exception) {
             Log.e(TAG, "signUp Exception: ${e.localizedMessage}", e)
-            Pair(false, "Network error during signup: ${e.localizedMessage}")
+            Pair(null, "Network error during signup: ${e.localizedMessage}")
         }
     }
 
@@ -131,25 +145,20 @@ class SupabaseService {
 
             if (response.isSuccessful) {
                 val json = JSONObject(respString)
+                val token = json.optString("access_token")
                 val userObj = json.optJSONObject("user")
-                val userMetaData = userObj?.optJSONObject("user_metadata")
-                val username = userMetaData?.optString("username") ?: cleanIdent
+                val userId = userObj?.optString("id") ?: ""
+                if (!token.isNullOrBlank()) currentUserToken = token
+                if (!userId.isNullOrBlank()) currentAuthUserId = userId
 
-                var profile = getProfileByUsername(username) ?: getProfileByEmail(emailToUse)
-                if (profile == null) {
-                    profile = UserEntity(
-                        username = username,
-                        fullName = userMetaData?.optString("full_name") ?: username,
-                        email = emailToUse,
-                        password = password
-                    )
+                // Query the profile by UUID: Always use profiles.id = auth user.id
+                val profile = getProfileByUuidWithRetry(userId, maxRetries = 10, delayMs = 1000)
+                if (profile != null) {
+                    Pair(profile, "Login successful!")
+                } else {
+                    Pair(null, "No username found or profile not created in 'profiles' table for UUID: $userId")
                 }
-                Pair(profile, "Login successful!")
             } else {
-                val directProfile = getProfileByUsername(cleanIdent) ?: getProfileByEmail(cleanIdent)
-                if (directProfile != null && (directProfile.password.isEmpty() || directProfile.password == password)) {
-                    return@withContext Pair(directProfile, "Login successful!")
-                }
                 val json = try { JSONObject(respString) } catch (e: Exception) { null }
                 val errorMsg = json?.optString("error_description") ?: json?.optString("message") ?: "Invalid credentials."
                 Pair(null, errorMsg)
@@ -157,6 +166,80 @@ class SupabaseService {
         } catch (e: Exception) {
             Log.e(TAG, "signIn Exception: ${e.localizedMessage}", e)
             Pair(null, "Network error: ${e.localizedMessage}")
+        }
+    }
+
+    suspend fun signInWithToken(accessToken: String): Pair<UserEntity?, String> = withContext(Dispatchers.IO) {
+        try {
+            if (accessToken.isBlank()) {
+                return@withContext Pair(null, "Access token is empty.")
+            }
+            currentUserToken = accessToken
+
+            // 1. Get user details from auth.uid() using the token
+            val authUrl = "$baseUrl/auth/v1/user"
+            val requestBuilder = Request.Builder().url(authUrl).get()
+            getHeaders(accessToken).forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            Log.d(TAG, "signInWithToken user status: ${response.code}, resp: $respString")
+
+            if (!response.isSuccessful) {
+                val json = try { JSONObject(respString) } catch (e: Exception) { null }
+                val errorMsg = json?.optString("error_description") ?: json?.optString("message") ?: "Failed to retrieve authenticated user."
+                return@withContext Pair(null, errorMsg)
+            }
+
+            val json = JSONObject(respString)
+            val userId = json.optString("id")
+            if (userId.isNullOrBlank()) {
+                return@withContext Pair(null, "User ID not found in Supabase Auth response.")
+            }
+            currentAuthUserId = userId
+
+            val email = json.optString("email")
+            val userMetadata = json.optJSONObject("user_metadata")
+            val fullName = userMetadata?.optString("full_name") ?: userMetadata?.optString("name") ?: email.substringBefore("@")
+
+            // Generate clean username
+            var username = userMetadata?.optString("username") ?: ""
+            if (username.isBlank()) {
+                val rawUsername = email.substringBefore("@").lowercase().filter { it.isLetterOrDigit() }
+                username = if (rawUsername.length in 3..20) rawUsername else "user" + UUID.randomUUID().toString().take(6)
+            }
+            username = username.lowercase().trim()
+
+            val avatarUrl = userMetadata?.optString("avatar_url")
+                ?: userMetadata?.optString("picture")
+                ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+
+            // 2. Query public.profiles using auth.uid()
+            val existingProfile = getProfileByUuidWithRetry(userId, maxRetries = 3, delayMs = 500)
+            if (existingProfile != null) {
+                return@withContext Pair(existingProfile, "Login successful!")
+            }
+
+            // 3. If no profile exists, create it automatically
+            val profileToCreate = UserEntity(
+                id = userId,
+                username = username,
+                fullName = fullName,
+                email = email,
+                password = "",
+                avatarUrl = avatarUrl
+            )
+
+            val upsertSuccess = upsertProfile(profileToCreate, userId)
+            if (upsertSuccess) {
+                val refetchedProfile = getProfileByUuidWithRetry(userId, maxRetries = 10, delayMs = 1000) ?: profileToCreate
+                Pair(refetchedProfile, "Login successful! New profile created.")
+            } else {
+                Pair(profileToCreate, "Login successful! (Profile creation pending/partial)")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "signInWithToken Exception: ${e.localizedMessage}", e)
+            Pair(null, "OAuth authentication error: ${e.localizedMessage}")
         }
     }
 
@@ -219,7 +302,8 @@ class SupabaseService {
         try {
             val url = "$baseUrl/rest/v1/profiles"
             val bodyJson = JSONObject().apply {
-                if (!userId.isNullOrBlank()) put("id", userId)
+                val targetId = if (!userId.isNullOrBlank()) userId else profile.id
+                if (!targetId.isNullOrBlank()) put("id", targetId)
                 put("username", profile.username.lowercase().trim())
                 put("full_name", profile.fullName)
                 put("email", profile.email)
@@ -287,6 +371,99 @@ class SupabaseService {
         }
     }
 
+    suspend fun getProfileByUuid(uuid: String): UserEntity? = withContext(Dispatchers.IO) {
+        if (uuid.isBlank()) return@withContext null
+        try {
+            val url = "$baseUrl/rest/v1/profiles?id=eq.$uuid&select=*"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                if (array.length() > 0) parseProfile(array.getJSONObject(0)) else null
+            } else {
+                val errJson = try { JSONObject(respString) } catch (e: Exception) { null }
+                val code = errJson?.optString("code") ?: ""
+                val message = errJson?.optString("message") ?: ""
+                val details = errJson?.optString("details") ?: ""
+                val hint = errJson?.optString("hint") ?: ""
+                Log.e(TAG, "console.error: code=$code, message=$message, details=$details, hint=$hint")
+                System.err.println("console.error: code=$code, message=$message, details=$details, hint=$hint")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getProfileByUuid Exception: ${e.localizedMessage}", e)
+            System.err.println("console.error: Exception: ${e.localizedMessage}")
+            null
+        }
+    }
+
+    suspend fun getProfileByUuidWithRetry(uuid: String, maxRetries: Int = 5, delayMs: Long = 1000): UserEntity? = withContext(Dispatchers.IO) {
+        if (uuid.isBlank()) return@withContext null
+        var lastErrorJson: String? = null
+        for (attempt in 1..maxRetries) {
+            try {
+                val url = "$baseUrl/rest/v1/profiles?id=eq.$uuid&select=*"
+                val requestBuilder = Request.Builder().url(url).get()
+                getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+                val response = client.newCall(requestBuilder.build()).execute()
+                val respString = response.body?.string() ?: ""
+                if (response.isSuccessful) {
+                    val array = JSONArray(respString)
+                    if (array.length() > 0) {
+                        return@withContext parseProfile(array.getJSONObject(0))
+                    }
+                } else {
+                    lastErrorJson = respString
+                    val errJson = try { JSONObject(respString) } catch (e: Exception) { null }
+                    val code = errJson?.optString("code") ?: ""
+                    val message = errJson?.optString("message") ?: ""
+                    val details = errJson?.optString("details") ?: ""
+                    val hint = errJson?.optString("hint") ?: ""
+                    Log.e(TAG, "console.error (attempt $attempt): code=$code, message=$message, details=$details, hint=$hint")
+                    System.err.println("console.error: code=$code, message=$message, details=$details, hint=$hint")
+                }
+            } catch (e: Exception) {
+                lastErrorJson = e.localizedMessage
+                Log.e(TAG, "getProfileByUuidWithRetry Exception (attempt $attempt): ${e.localizedMessage}", e)
+                System.err.println("console.error: Exception (attempt $attempt): ${e.localizedMessage}")
+            }
+            if (attempt < maxRetries) {
+                kotlinx.coroutines.delay(delayMs)
+            }
+        }
+        null
+    }
+
+    suspend fun getCurrentUserAuthId(): String? = withContext(Dispatchers.IO) {
+        if (!currentAuthUserId.isNullOrBlank()) return@withContext currentAuthUserId
+        val token = currentUserToken
+        if (!token.isNullOrBlank()) {
+            try {
+                val url = "$baseUrl/auth/v1/user"
+                val requestBuilder = Request.Builder().url(url).get()
+                getHeaders(token).forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+                val response = client.newCall(requestBuilder.build()).execute()
+                val respString = response.body?.string() ?: ""
+                if (response.isSuccessful) {
+                    val json = JSONObject(respString)
+                    val id = json.optString("id")
+                    if (id.isNotBlank()) {
+                        currentAuthUserId = id
+                        return@withContext id
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "getCurrentUserAuthId error: ${e.localizedMessage}")
+            }
+        }
+        return@withContext null
+    }
+
     suspend fun getProfileByEmail(email: String): UserEntity? = withContext(Dispatchers.IO) {
         try {
             val url = "$baseUrl/rest/v1/profiles?email=eq.${email.lowercase().trim()}&select=*"
@@ -306,6 +483,7 @@ class SupabaseService {
 
     private fun parseProfile(obj: JSONObject): UserEntity {
         return UserEntity(
+            id = obj.optString("id"),
             username = obj.optString("username"),
             fullName = obj.optString("full_name"),
             email = obj.optString("email"),
@@ -328,21 +506,38 @@ class SupabaseService {
         if (followerUsername.isBlank() || followingUsername.isBlank() || followerUsername.equals(followingUsername, ignoreCase = true)) {
             return@withContext "none"
         }
+        val follower = followerUsername.lowercase().trim()
+        val following = followingUsername.lowercase().trim()
         try {
-            val url = "$baseUrl/rest/v1/follows?follower_username=eq.${followerUsername.lowercase().trim()}&following_username=eq.${followingUsername.lowercase().trim()}&select=status"
-            val requestBuilder = Request.Builder().url(url).get()
-            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+            val followerProfile = getProfileByUsername(follower) ?: return@withContext "none"
+            val followingProfile = getProfileByUsername(following) ?: return@withContext "none"
+            val followerId = followerProfile.id
+            val followingId = followingProfile.id
+            if (followerId.isBlank() || followingId.isBlank()) return@withContext "none"
 
-            val response = client.newCall(requestBuilder.build()).execute()
-            val respString = response.body?.string() ?: ""
-            if (response.isSuccessful) {
-                val array = JSONArray(respString)
-                if (array.length() > 0) {
-                    array.getJSONObject(0).optString("status", "following")
-                } else "none"
-            } else "none"
+            // 1. Check follows table
+            val followsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$followerId&following_id=eq.$followingId&select=id"
+            val req1 = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req1.addHeader(k, v) }
+            val resp1 = client.newCall(req1.build()).execute()
+            val body1 = resp1.body?.string() ?: ""
+            if (resp1.isSuccessful && JSONArray(body1).length() > 0) {
+                return@withContext "following"
+            }
+
+            // 2. Check follow_requests table
+            val reqsUrl = "$baseUrl/rest/v1/follow_requests?requester_id=eq.$followerId&target_id=eq.$followingId&select=id"
+            val req2 = Request.Builder().url(reqsUrl).get()
+            getHeaders().forEach { (k, v) -> req2.addHeader(k, v) }
+            val resp2 = client.newCall(req2.build()).execute()
+            val body2 = resp2.body?.string() ?: ""
+            if (resp2.isSuccessful && JSONArray(body2).length() > 0) {
+                return@withContext "requested"
+            }
+
+            "none"
         } catch (e: Exception) {
-            Log.e(TAG, "getFollowStatus exception: ${e.localizedMessage}")
+            Log.e(TAG, "getFollowStatus exception for $follower -> $following: ${e.localizedMessage}", e)
             "none"
         }
     }
@@ -350,37 +545,97 @@ class SupabaseService {
     suspend fun toggleFollow(followerUsername: String, followingUsername: String, isTargetPrivate: Boolean): String = withContext(Dispatchers.IO) {
         val follower = followerUsername.lowercase().trim()
         val following = followingUsername.lowercase().trim()
-        if (follower.isBlank() || following.isBlank() || follower == following) return@withContext "none"
+        if (follower.isBlank() || following.isBlank() || follower == following) {
+            Log.w(TAG, "toggleFollow ignored: invalid parameters or self-follow attempt ($follower -> $following)")
+            return@withContext "none"
+        }
 
         try {
+            val followerProfile = getProfileByUsername(follower) ?: return@withContext "none"
+            val followingProfile = getProfileByUsername(following) ?: return@withContext "none"
+            val followerId = followerProfile.id
+            val followingId = followingProfile.id
+            if (followerId.isBlank() || followingId.isBlank()) return@withContext "none"
+
             val currentStatus = getFollowStatus(follower, following)
             if (currentStatus == "following" || currentStatus == "requested") {
-                // Delete follow row
-                val url = "$baseUrl/rest/v1/follows?follower_username=eq.$follower&following_username=eq.$following"
-                val requestBuilder = Request.Builder().url(url).delete()
-                getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-                val response = client.newCall(requestBuilder.build()).execute()
-                Log.d(TAG, "unfollow delete code: ${response.code}")
+                // Delete from follows and follow_requests
+                val delFollowsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$followerId&following_id=eq.$followingId"
+                val reqDel1 = Request.Builder().url(delFollowsUrl).delete()
+                getHeaders().forEach { (k, v) -> reqDel1.addHeader(k, v) }
+                val respDel1 = client.newCall(reqDel1.build()).execute()
+                Log.d(TAG, "unfollow follows delete code: ${respDel1.code}")
+
+                val delReqsUrl = "$baseUrl/rest/v1/follow_requests?requester_id=eq.$followerId&target_id=eq.$followingId"
+                val reqDel2 = Request.Builder().url(delReqsUrl).delete()
+                getHeaders().forEach { (k, v) -> reqDel2.addHeader(k, v) }
+                val respDel2 = client.newCall(reqDel2.build()).execute()
+                Log.d(TAG, "unfollow follow_requests delete code: ${respDel2.code}")
+
                 "none"
             } else {
                 val newStatus = if (isTargetPrivate) "requested" else "following"
-                val url = "$baseUrl/rest/v1/follows"
-                val bodyJson = JSONObject().apply {
-                    put("follower_username", follower)
-                    put("following_username", following)
-                    put("status", newStatus)
+                if (isTargetPrivate) {
+                    val bodyReq = JSONObject().apply {
+                        put("requester_id", followerId)
+                        put("target_id", followingId)
+                    }
+                    val req = Request.Builder().url("$baseUrl/rest/v1/follow_requests").post(bodyReq.toString().toRequestBody("application/json".toMediaType()))
+                    getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+                    val resp = client.newCall(req.build()).execute()
+                    val respStr = resp.body?.string() ?: ""
+                    Log.d(TAG, "insert follow_requests response: ${resp.code}, body: $respStr")
+                } else {
+                    val bodyFol = JSONObject().apply {
+                        put("follower_id", followerId)
+                        put("following_id", followingId)
+                    }
+                    val req = Request.Builder().url("$baseUrl/rest/v1/follows").post(bodyFol.toString().toRequestBody("application/json".toMediaType()))
+                    getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+                    val resp = client.newCall(req.build()).execute()
+                    val respStr = resp.body?.string() ?: ""
+                    Log.d(TAG, "insert follows response: ${resp.code}, body: $respStr")
                 }
-                val requestBuilder = Request.Builder()
-                    .url(url)
-                    .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
-                getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-                val response = client.newCall(requestBuilder.build()).execute()
-                Log.d(TAG, "follow insert code: ${response.code}")
+
                 newStatus
             }
         } catch (e: Exception) {
-            Log.e(TAG, "toggleFollow exception: ${e.localizedMessage}", e)
+            Log.e(TAG, "toggleFollow Exception for $follower -> $following: ${e.localizedMessage}", e)
             "none"
+        }
+    }
+
+    suspend fun acceptFollowRequest(actorUsername: String, currentUsername: String): Boolean = withContext(Dispatchers.IO) {
+        val actor = actorUsername.lowercase().trim()
+        val current = currentUsername.lowercase().trim()
+        try {
+            val actorProfile = getProfileByUsername(actor) ?: return@withContext false
+            val currentProfile = getProfileByUsername(current) ?: return@withContext false
+            val actorId = actorProfile.id
+            val currentId = currentProfile.id
+            if (actorId.isBlank() || currentId.isBlank()) return@withContext false
+
+            // Delete from follow_requests
+            val delUrl = "$baseUrl/rest/v1/follow_requests?requester_id=eq.$actorId&target_id=eq.$currentId"
+            val reqDel = Request.Builder().url(delUrl).delete()
+            getHeaders().forEach { (k, v) -> reqDel.addHeader(k, v) }
+            client.newCall(reqDel.build()).execute()
+
+            // Insert into follows
+            val body = JSONObject().apply {
+                put("follower_id", actorId)
+                put("following_id", currentId)
+            }
+            val insUrl = "$baseUrl/rest/v1/follows"
+            val reqIns = Request.Builder().url(insUrl).post(body.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> reqIns.addHeader(k, v) }
+            val resp = client.newCall(reqIns.build()).execute()
+            Log.d(TAG, "acceptFollowRequest follows insert code: ${resp.code}")
+
+            resp.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "acceptFollowRequest exception: ${e.localizedMessage}", e)
+            false
         }
     }
 
@@ -707,8 +962,22 @@ class SupabaseService {
         try {
             val cUser = currentUsername.lowercase().trim()
             val pUser = peerUsername.lowercase().trim()
+            if (cUser.isBlank() || pUser.isBlank()) return@withContext emptyList()
 
-            val url = "$baseUrl/rest/v1/messages?or=(and(sender_username.eq.$cUser,recipient_username.eq.$pUser),and(sender_username.eq.$pUser,recipient_username.eq.$cUser),conversation_id.eq.$pUser)&order=created_at.asc"
+            val currentProfile = getProfileByUsername(cUser) ?: return@withContext emptyList()
+            val peerProfile = getProfileByUsername(pUser) ?: return@withContext emptyList()
+            val currentId = currentProfile.id
+            val peerId = peerProfile.id
+            if (currentId.isBlank() || peerId.isBlank()) return@withContext emptyList()
+
+            val sorted = listOf(currentId, peerId).sorted()
+            val convUuid = try {
+                java.util.UUID.nameUUIDFromBytes("conversation_${sorted[0]}_${sorted[1]}".toByteArray()).toString()
+            } catch (e: Exception) {
+                java.util.UUID.randomUUID().toString()
+            }
+
+            val url = "$baseUrl/rest/v1/messages?or=(conversation_uuid.eq.$convUuid,and(sender_id.eq.$currentId,recipient_id.eq.$peerId),and(sender_id.eq.$peerId,recipient_id.eq.$currentId))&order=created_at.asc"
             val requestBuilder = Request.Builder().url(url).get()
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
@@ -717,27 +986,55 @@ class SupabaseService {
             if (response.isSuccessful) {
                 val array = JSONArray(respString)
                 val list = mutableListOf<MessageEntity>()
+                val seenIds = mutableSetOf<Long>()
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
-                    val sender = obj.optString("sender_username")
+                    val id = obj.optLong("id")
+                    if (id != 0L && seenIds.contains(id)) continue
+                    if (id != 0L) seenIds.add(id)
+
+                    val sender = obj.optString("sender_username").ifBlank {
+                        val sId = obj.optString("sender_id")
+                        if (sId == currentId) cUser else pUser
+                    }
+                    val readAtStr = obj.optString("read_at").takeIf { it.isNotBlank() && it != "null" }
+                    val delAtStr = obj.optString("delivered_at").takeIf { it.isNotBlank() && it != "null" }
+                    val rawStatus = obj.optString("status", "")
+                    
+                    val calculatedStatus = when {
+                        !readAtStr.isNullOrBlank() || rawStatus == "read" -> "read"
+                        !delAtStr.isNullOrBlank() || rawStatus == "delivered" -> "delivered"
+                        rawStatus.isNotBlank() -> rawStatus
+                        else -> "sent"
+                    }
+
                     list.add(
                         MessageEntity(
-                            id = obj.optLong("id"),
+                            id = id,
                             conversationId = pUser,
                             senderUsername = sender,
-                            recipientUsername = obj.optString("recipient_username"),
-                            senderAvatar = obj.optString("sender_avatar"),
+                            recipientUsername = obj.optString("recipient_username").ifBlank {
+                                val rId = obj.optString("recipient_id")
+                                if (rId == currentId) cUser else pUser
+                            },
+                            senderAvatar = obj.optString("sender_avatar").ifBlank {
+                                if (sender.equals(cUser, ignoreCase = true)) currentProfile.avatarUrl else peerProfile.avatarUrl
+                            },
                             text = obj.optString("text"),
                             mediaUrl = obj.optString("media_url"),
                             type = obj.optString("type", "text"),
-                            isMine = sender.equals(cUser, ignoreCase = true),
-                            timestamp = formatTimestamp(obj.optString("created_at"))
+                            timestamp = formatTimestamp(obj.optString("created_at")),
+                            isRead = calculatedStatus == "read",
+                            readAt = readAtStr,
+                            deliveredAt = delAtStr,
+                            status = calculatedStatus,
+                            isMine = sender.equals(cUser, ignoreCase = true)
                         )
                     )
                 }
                 list
             } else {
-                Log.e(TAG, "getMessagesForConversation failed code: ${response.code}")
+                Log.e(TAG, "getMessagesForConversation failed code: ${response.code}, body: $respString")
                 emptyList()
             }
         } catch (e: Exception) {
@@ -748,15 +1045,36 @@ class SupabaseService {
 
     suspend fun sendMessage(message: MessageEntity): Boolean = withContext(Dispatchers.IO) {
         try {
+            val cUser = message.senderUsername.lowercase().trim()
+            val pUser = message.recipientUsername.lowercase().trim()
+            val currentProfile = getProfileByUsername(cUser)
+            val peerProfile = getProfileByUsername(pUser)
+            val currentId = currentProfile?.id ?: currentAuthUserId ?: ""
+            val peerId = peerProfile?.id ?: ""
+            if (currentId.isBlank() || peerId.isBlank()) {
+                Log.e(TAG, "sendMessage failed: empty user UUIDs (sender=$currentId, recipient=$peerId)")
+                return@withContext false
+            }
+
+            val sorted = listOf(currentId, peerId).sorted()
+            val convUuid = try {
+                java.util.UUID.nameUUIDFromBytes("conversation_${sorted[0]}_${sorted[1]}".toByteArray()).toString()
+            } catch (e: Exception) {
+                java.util.UUID.randomUUID().toString()
+            }
+
             val url = "$baseUrl/rest/v1/messages"
             val bodyJson = JSONObject().apply {
-                put("conversation_id", message.conversationId)
-                put("sender_username", message.senderUsername)
-                put("recipient_username", message.recipientUsername)
+                put("conversation_uuid", convUuid)
+                put("sender_id", currentId)
+                put("recipient_id", peerId)
+                put("sender_username", cUser)
+                put("recipient_username", pUser)
                 put("sender_avatar", message.senderAvatar)
                 put("text", message.text)
                 put("media_url", message.mediaUrl)
                 put("type", message.type)
+                put("status", "sent")
             }
 
             val requestBuilder = Request.Builder()
@@ -765,11 +1083,156 @@ class SupabaseService {
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
             val response = client.newCall(requestBuilder.build()).execute()
-            Log.d(TAG, "sendMessage response code: ${response.code}")
+            val respStr = response.body?.string() ?: ""
+            Log.d(TAG, "sendMessage response code: ${response.code}, body: $respStr")
             response.isSuccessful
         } catch (e: Exception) {
             Log.e(TAG, "sendMessage Exception: ${e.localizedMessage}", e)
             false
+        }
+    }
+
+    suspend fun markMessagesAsRead(currentUsername: String, peerUsername: String): Boolean = withContext(Dispatchers.IO) {
+        val cUser = currentUsername.lowercase().trim()
+        val pUser = peerUsername.lowercase().trim()
+        if (cUser.isBlank() || pUser.isBlank()) return@withContext false
+
+        try {
+            val currentProfile = getProfileByUsername(cUser)
+            val peerProfile = getProfileByUsername(pUser)
+            val currentId = currentProfile?.id ?: ""
+            val peerId = peerProfile?.id ?: ""
+            if (currentId.isBlank() || peerId.isBlank()) return@withContext false
+
+            val nowIso = java.time.Instant.now().toString()
+            val url = "$baseUrl/rest/v1/messages?recipient_id=eq.$currentId&sender_id=eq.$peerId&read_at=is.null"
+            val bodyJson = JSONObject().apply {
+                put("read_at", nowIso)
+                put("status", "read")
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .patch(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            Log.d(TAG, "markMessagesAsRead response code: ${response.code}")
+            response.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "markMessagesAsRead Exception: ${e.localizedMessage}", e)
+            false
+        }
+    }
+
+    suspend fun getUnreadCounts(currentUsername: String): Map<String, Int> = withContext(Dispatchers.IO) {
+        val cUser = currentUsername.lowercase().trim()
+        if (cUser.isBlank()) return@withContext emptyMap()
+
+        try {
+            val currentProfile = getProfileByUsername(cUser)
+            val currentId = currentProfile?.id ?: ""
+            if (currentId.isBlank()) return@withContext emptyMap()
+
+            val url = "$baseUrl/rest/v1/messages?recipient_id=eq.$currentId&read_at=is.null&select=sender_id,sender_username,id"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                val counts = mutableMapOf<String, Int>()
+                for (i in 0 until array.length()) {
+                    val item = array.getJSONObject(i)
+                    var sender = item.optString("sender_username").lowercase().trim()
+                    if (sender.isBlank()) {
+                        val senderId = item.optString("sender_id")
+                        if (senderId.isNotBlank()) {
+                            val prof = getProfileByUuid(senderId)
+                            if (prof != null) {
+                                sender = prof.username.lowercase().trim()
+                            }
+                        }
+                    }
+                    if (sender.isNotBlank()) {
+                        counts[sender] = (counts[sender] ?: 0) + 1
+                    }
+                }
+                counts
+            } else emptyMap()
+        } catch (e: Exception) {
+            Log.e(TAG, "getUnreadCounts Exception: ${e.localizedMessage}")
+            emptyMap()
+        }
+    }
+
+    suspend fun sendTypingStatus(conversationUuid: String, userUuid: String, isTyping: Boolean): Boolean = withContext(Dispatchers.IO) {
+        if (conversationUuid.isBlank() || userUuid.isBlank()) return@withContext false
+
+        try {
+            val url = "$baseUrl/rest/v1/typing_status"
+            val bodyJson = JSONObject().apply {
+                put("conversation_id", conversationUuid)
+                put("user_id", userUuid)
+                put("is_typing", isTyping)
+                put("updated_at", java.time.Instant.now().toString())
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                .addHeader("Prefer", "resolution=merge-duplicates")
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respStr = response.body?.string() ?: ""
+            if (response.code == 404) {
+                Log.w(TAG, "sendTypingStatus: typing_status table not found on Supabase (404)")
+                return@withContext false
+            }
+            Log.d(TAG, "sendTypingStatus code: ${response.code}, body: $respStr")
+            response.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "sendTypingStatus exception: ${e.localizedMessage}")
+            false
+        }
+    }
+
+    suspend fun getTypingUsers(conversationUuid: String, currentUserUuid: String): List<String> = withContext(Dispatchers.IO) {
+        if (conversationUuid.isBlank()) return@withContext emptyList()
+
+        try {
+            val url = "$baseUrl/rest/v1/typing_status?conversation_id=eq.$conversationUuid&user_id=neq.$currentUserUuid&is_typing=eq.true&select=user_id,updated_at"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.code == 404) {
+                return@withContext emptyList()
+            }
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                val activeTypingUserIds = mutableListOf<String>()
+                val now = System.currentTimeMillis()
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    val uId = obj.optString("user_id")
+                    val updatedStr = obj.optString("updated_at")
+                    val timestamp = try {
+                        java.time.Instant.parse(updatedStr).toEpochMilli()
+                    } catch (e: Exception) { now }
+
+                    // Automatically clear typing after 2 seconds of inactivity
+                    if (now - timestamp < 2000) {
+                        activeTypingUserIds.add(uId)
+                    }
+                }
+                activeTypingUserIds
+            } else emptyList()
+        } catch (e: Exception) {
+            emptyList()
         }
     }
 
@@ -904,9 +1367,171 @@ class SupabaseService {
         }
     }
 
+    // --- CALLS & LIVEKIT SIGNALING ---
+
+    suspend fun createCallRecordEx(
+        callerUuid: String,
+        receiverUuid: String,
+        roomId: String,
+        callType: String
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (callerUuid.isBlank() || receiverUuid.isBlank()) {
+            return@withContext Pair(false, "Please sign in again.")
+        }
+        Log.d(TAG, "Creating call record: caller_id=$callerUuid, receiver_id=$receiverUuid, room_id=$roomId, call_type=$callType")
+        try {
+            val url = "$baseUrl/rest/v1/calls"
+            val bodyJson = JSONObject().apply {
+                put("caller_id", callerUuid)
+                put("receiver_id", receiverUuid)
+                put("room_id", roomId)
+                put("room_name", roomId)
+                put("call_type", callType)
+                put("status", "ringing")
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respBody = response.body?.string() ?: ""
+            Log.d(TAG, "createCallRecord status code: ${response.code}")
+
+            if (response.isSuccessful || response.code == 201) {
+                Pair(true, "Call initiated successfully")
+            } else {
+                Log.e(TAG, "createCallRecord error code: ${response.code}, body: $respBody")
+                Pair(false, "Supabase Call Error (${response.code}): $respBody")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "createCallRecord exception: ${e.localizedMessage}", e)
+            Pair(false, "Call creation exception: ${e.localizedMessage}")
+        }
+    }
+
+    suspend fun createCallRecord(call: CallRecord): Boolean {
+        val (success, _) = createCallRecordEx(
+            callerUuid = call.callerId,
+            receiverUuid = call.receiverId,
+            roomId = call.roomName.ifBlank { call.id },
+            callType = call.callType
+        )
+        return success
+    }
+
+    suspend fun updateCallStatus(callId: String, status: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val url = "$baseUrl/rest/v1/calls?id=eq.$callId"
+            val bodyJson = JSONObject().apply {
+                put("status", status)
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .patch(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            Log.d(TAG, "updateCallStatus status: ${response.code}")
+            response.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "updateCallStatus exception: ${e.localizedMessage}", e)
+            false
+        }
+    }
+
+    suspend fun getCallRecord(callId: String): CallRecord? = withContext(Dispatchers.IO) {
+        try {
+            val url = "$baseUrl/rest/v1/calls?id=eq.$callId&select=*"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                if (array.length() > 0) parseCallRecord(array.getJSONObject(0)) else null
+            } else null
+        } catch (e: Exception) {
+            Log.e(TAG, "getCallRecord exception: ${e.localizedMessage}")
+            null
+        }
+    }
+
+    suspend fun getPendingIncomingCall(receiverId: String): CallRecord? = withContext(Dispatchers.IO) {
+        if (receiverId.isBlank()) return@withContext null
+        try {
+            val url = "$baseUrl/rest/v1/calls?receiver_id=eq.${receiverId.lowercase().trim()}&status=eq.ringing&order=created_at.desc&limit=1"
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                if (array.length() > 0) parseCallRecord(array.getJSONObject(0)) else null
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    suspend fun fetchLiveKitToken(roomName: String, identity: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val url = "$baseUrl/functions/v1/get-livekit-token"
+            val bodyJson = JSONObject().apply {
+                put("roomName", roomName)
+                put("identity", identity)
+            }
+
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+            if (response.isSuccessful) {
+                val json = JSONObject(respString)
+                json.optString("token").takeIf { it.isNotBlank() }
+            } else {
+                Log.e(TAG, "fetchLiveKitToken code: ${response.code}, body: $respString")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchLiveKitToken exception: ${e.localizedMessage}")
+            null
+        }
+    }
+
+    private fun parseCallRecord(obj: JSONObject): CallRecord {
+        val roomId = obj.optString("room_id").ifBlank { obj.optString("room_name") }
+        return CallRecord(
+            id = obj.optString("id"),
+            roomName = roomId,
+            callerId = obj.optString("caller_id"),
+            receiverId = obj.optString("receiver_id"),
+            callType = obj.optString("call_type", "audio"),
+            status = obj.optString("status", "ringing"),
+            createdAt = obj.optString("created_at")
+        )
+    }
+
     private fun formatTimestamp(isoStr: String?): String {
         if (isoStr.isNullOrBlank()) return "Just now"
         return "Recently"
     }
 }
+
+data class CallRecord(
+    val id: String = "",
+    val roomName: String = "",
+    val callerId: String = "",
+    val receiverId: String = "",
+    val callType: String = "audio",
+    val status: String = "ringing",
+    val createdAt: String = ""
+)
 

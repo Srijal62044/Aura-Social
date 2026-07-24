@@ -54,10 +54,45 @@ import com.example.ui.theme.AuraTheme
 class MainActivity : ComponentActivity() {
     private val viewModel: AuraViewModel by viewModels()
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: android.content.Intent?) {
+        val data = intent?.data
+        if (data != null && data.scheme == "aurasocial" && data.host == "login-callback") {
+            android.util.Log.d("MainActivity", "Deep link received: $data")
+            
+            // Supabase sends access_token, etc., in the fragment (#) or as query parameters. Let's parse both.
+            val fragment = data.fragment
+            val params = mutableMapOf<String, String>()
+            if (!fragment.isNullOrBlank()) {
+                fragment.split("&").forEach { pair ->
+                    val parts = pair.split("=", limit = 2)
+                    if (parts.size == 2) {
+                        params[parts[0]] = parts[1]
+                    }
+                }
+            }
+            
+            val accessToken = data.getQueryParameter("access_token") ?: params["access_token"]
+            if (!accessToken.isNullOrBlank()) {
+                android.util.Log.d("MainActivity", "Extracted access token successfully from deep link!")
+                viewModel.loginWithGoogleToken(accessToken)
+            } else {
+                android.util.Log.e("MainActivity", "No access token found in redirect URL: $data")
+                viewModel.showFeedback("Google Sign-In failed: Access token missing.")
+            }
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleIntent(intent)
 
         try {
             val imageLoader = coil.ImageLoader.Builder(this)
@@ -107,6 +142,10 @@ class MainActivity : ComponentActivity() {
 
             val selectedConversationId by viewModel.selectedConversationId.collectAsStateWithLifecycle()
             val activeMessages by viewModel.activeMessages.collectAsStateWithLifecycle()
+            val unreadCountsPerConversation by viewModel.unreadCountsPerConversation.collectAsStateWithLifecycle()
+            val totalUnreadMessagesCount by viewModel.totalUnreadMessagesCount.collectAsStateWithLifecycle()
+            val isPeerTyping by viewModel.isPeerTyping.collectAsStateWithLifecycle()
+            val typingPeerUsername by viewModel.typingPeerUsername.collectAsStateWithLifecycle()
             val callState by viewModel.callState.collectAsStateWithLifecycle()
 
             val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
@@ -131,7 +170,16 @@ class MainActivity : ComponentActivity() {
                         onLogin = { u, p -> viewModel.login(u, p) },
                         onRegister = { n, u, e, p -> viewModel.register(n, u, e, p) },
                         onResetPassword = { u, p -> viewModel.resetPassword(u, p) },
-                        onSwitchState = { state -> viewModel.switchAuthState(state) }
+                        onSwitchState = { state -> viewModel.switchAuthState(state) },
+                        onGoogleSignIn = {
+                            val oauthUrl = viewModel.getGoogleOAuthUrl()
+                            try {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(oauthUrl))
+                                this@MainActivity.startActivity(intent)
+                            } catch (e: Exception) {
+                                viewModel.showFeedback("Could not open browser for Google sign-in: ${e.localizedMessage}")
+                            }
+                        }
                     )
                 } else {
                     val showTopAndBottomBars = currentScreen in listOf(
@@ -150,7 +198,7 @@ class MainActivity : ComponentActivity() {
                                 AuraTopBar(
                                     currentScreen = currentScreen,
                                     unreadNotificationsCount = notifications.count { !it.isRead },
-                                    unreadMessagesCount = 1,
+                                    unreadMessagesCount = totalUnreadMessagesCount,
                                     isAdmin = currentUser?.isAdmin ?: true,
                                     onNavigate = { viewModel.navigateTo(it) },
                                     onOpenAdmin = { viewModel.navigateTo(AuraScreen.ADMIN_DASHBOARD) },
@@ -290,6 +338,7 @@ class MainActivity : ComponentActivity() {
 
                                     AuraScreen.DIRECT_MESSAGES -> DirectMessagesScreen(
                                         users = allUsers.filter { it.username != currentUsername },
+                                        unreadCounts = unreadCountsPerConversation,
                                         onBackClick = { viewModel.navigateTo(AuraScreen.HOME) },
                                         onOpenChat = { username -> viewModel.openChat(username) }
                                     )
@@ -297,11 +346,17 @@ class MainActivity : ComponentActivity() {
                                     AuraScreen.CHAT_DETAIL -> ChatDetailScreen(
                                         conversationId = selectedConversationId ?: "Chat",
                                         messages = activeMessages,
-                                        onBackClick = { viewModel.navigateTo(AuraScreen.DIRECT_MESSAGES) },
+                                        isPeerTyping = isPeerTyping,
+                                        typingPeerUsername = typingPeerUsername,
+                                        onBackClick = {
+                                            viewModel.closeChat()
+                                            viewModel.navigateTo(AuraScreen.DIRECT_MESSAGES)
+                                        },
                                         onStartCall = { isVideo -> viewModel.startCall(isVideo) },
                                         onSendMessage = { text, media, type ->
                                             viewModel.sendMessage(text, media, type)
                                         },
+                                        onTyping = { viewModel.onUserTyping() },
                                         onDeleteMessage = { id -> viewModel.deleteMessage(id) }
                                     )
 
@@ -385,6 +440,10 @@ class MainActivity : ComponentActivity() {
                             // Active Audio/Video Call Overlay
                             CallOverlayModal(
                                 callState = callState,
+                                liveKitManager = viewModel.liveKitManager,
+                                onAcceptCall = { viewModel.acceptCall(this@MainActivity) },
+                                onDeclineCall = { viewModel.declineCall() },
+                                onCancelCall = { viewModel.cancelCall() },
                                 onEndCall = { viewModel.endCall() },
                                 onToggleMute = { viewModel.toggleMute() },
                                 onToggleCamera = { viewModel.toggleCamera() }

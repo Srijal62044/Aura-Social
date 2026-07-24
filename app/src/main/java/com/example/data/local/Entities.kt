@@ -6,6 +6,7 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "users")
 data class UserEntity(
     @PrimaryKey val username: String,
+    val id: String = "",
     val fullName: String,
     val email: String,
     val password: String = "",
@@ -111,6 +112,9 @@ data class MessageEntity(
     val type: String = "text", // "text", "image", "voice", "post_share"
     val timestamp: String = "Just now",
     val isRead: Boolean = false,
+    val readAt: String? = null,
+    val deliveredAt: String? = null,
+    val status: String = "sent", // "sending", "sent", "delivered", "read", "failed"
     val isMine: Boolean = true,
     val reaction: String = ""
 )

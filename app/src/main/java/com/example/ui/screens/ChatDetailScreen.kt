@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -34,13 +35,19 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -50,10 +57,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,6 +71,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -70,14 +80,18 @@ import com.example.data.local.MessageEntity
 import com.example.ui.theme.AuraPink
 import com.example.ui.theme.AuraPurple
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun ChatDetailScreen(
     conversationId: String,
     messages: List<MessageEntity>,
+    isPeerTyping: Boolean = false,
+    typingPeerUsername: String? = null,
     onBackClick: () -> Unit,
     onStartCall: (Boolean) -> Unit, // true: video call, false: voice call
     onSendMessage: (String, String, String) -> Unit,
+    onTyping: () -> Unit = {},
     onDeleteMessage: (Long) -> Unit
 ) {
     var messageText by remember { mutableStateOf("") }
@@ -85,6 +99,10 @@ fun ChatDetailScreen(
     var recordingSeconds by remember { mutableIntStateOf(0) }
     var showPhotoOptionsDialog by remember { mutableStateOf(false) }
     var selectedFullImage by remember { mutableStateOf<String?>(null) }
+    var showNewMessageBadge by remember { mutableStateOf(false) }
+
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
 
     // Launcher for picking photos from gallery
     val galleryLauncher = rememberLauncherForActivityResult(
@@ -92,6 +110,31 @@ fun ChatDetailScreen(
     ) { uri: Uri? ->
         uri?.let {
             onSendMessage("Photo 📸", it.toString(), "image")
+        }
+    }
+
+    // Auto-scroll logic when new messages arrive
+    val isNearBottom by remember {
+        derivedStateOf {
+            val layoutInfo = listState.layoutInfo
+            val totalItems = layoutInfo.totalItemsCount
+            if (totalItems == 0) true
+            else {
+                val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                lastVisible >= totalItems - 3
+            }
+        }
+    }
+
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            val lastMsg = messages.last()
+            if (isNearBottom || lastMsg.isMine) {
+                showNewMessageBadge = false
+                listState.animateScrollToItem(messages.size - 1)
+            } else {
+                showNewMessageBadge = true
+            }
         }
     }
 
@@ -113,7 +156,7 @@ fun ChatDetailScreen(
             .imePadding()
             .testTag("chat_detail_screen")
     ) {
-        // Chat Header with Call Buttons
+        // Chat Header with Call Buttons & Typing indicator
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -143,20 +186,32 @@ fun ChatDetailScreen(
                         )
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF22C55E))
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Active now",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        if (isPeerTyping) {
+                            Text(
+                                text = "typing...",
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontStyle = FontStyle.Italic,
+                                    color = AuraPink
+                                )
                             )
-                        )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF22C55E))
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Active now",
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -186,81 +241,166 @@ fun ChatDetailScreen(
             }
         }
 
-        // Messages History
-        LazyColumn(
+        // Messages History with Floating New Message Badge
+        Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            items(messages, key = { it.id }) { msg ->
-                val isMine = msg.isMine
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(
-                                RoundedCornerShape(
-                                    topStart = 18.dp,
-                                    topEnd = 18.dp,
-                                    bottomStart = if (isMine) 18.dp else 4.dp,
-                                    bottomEnd = if (isMine) 4.dp else 18.dp
-                                )
-                            )
-                            .background(if (isMine) AuraPink else MaterialTheme.colorScheme.surfaceVariant)
-                            .padding(12.dp)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(messages, key = { it.id }) { msg ->
+                    val isMine = msg.isMine
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start
                     ) {
-                        Column {
-                            // Check message type (Photo, Voice Note, or Text)
-                            if (msg.mediaUrl.isNotBlank() || msg.type == "image") {
-                                val imgUrl = msg.mediaUrl.ifBlank { "https://images.unsplash.com/photo-1518770660439-4636190af475?w=800" }
-                                AsyncImage(
-                                    model = imgUrl,
-                                    contentDescription = "Message Photo",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .size(width = 220.dp, height = 180.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .clickable { selectedFullImage = imgUrl }
+                        Box(
+                            modifier = Modifier
+                                .clip(
+                                    RoundedCornerShape(
+                                        topStart = 18.dp,
+                                        topEnd = 18.dp,
+                                        bottomStart = if (isMine) 18.dp else 4.dp,
+                                        bottomEnd = if (isMine) 4.dp else 18.dp
+                                    )
                                 )
-                                if (msg.text.isNotBlank() && msg.text != "Photo 📸" && msg.text != "Shared photo 📸") {
-                                    Spacer(modifier = Modifier.height(6.dp))
+                                .background(if (isMine) AuraPink else MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(12.dp)
+                        ) {
+                            Column {
+                                // Check message type (Photo, Voice Note, or Text)
+                                if (msg.mediaUrl.isNotBlank() || msg.type == "image") {
+                                    val imgUrl = msg.mediaUrl.ifBlank { "https://images.unsplash.com/photo-1518770660439-4636190af475?w=800" }
+                                    AsyncImage(
+                                        model = imgUrl,
+                                        contentDescription = "Message Photo",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(width = 220.dp, height = 180.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable { selectedFullImage = imgUrl }
+                                    )
+                                    if (msg.text.isNotBlank() && msg.text != "Photo 📸" && msg.text != "Shared photo 📸") {
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Text(
+                                            text = msg.text,
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                color = if (isMine) Color.White else MaterialTheme.colorScheme.onSurface
+                                            )
+                                        )
+                                    }
+                                } else if (msg.type == "voice") {
+                                    VoiceNoteBubble(
+                                        durationText = msg.text.ifBlank { "Voice Note (0:15)" },
+                                        isMine = isMine
+                                    )
+                                } else {
                                     Text(
                                         text = msg.text,
-                                        style = MaterialTheme.typography.bodyMedium.copy(
-                                            color = if (isMine) Color.White else MaterialTheme.colorScheme.onSurface
+                                        style = MaterialTheme.typography.bodyLarge.copy(
+                                            color = if (isMine) Color.White else MaterialTheme.colorScheme.onSurface,
+                                            fontSize = 14.sp
                                         )
                                     )
                                 }
-                            } else if (msg.type == "voice") {
-                                VoiceNoteBubble(
-                                    durationText = msg.text.ifBlank { "Voice Note (0:15)" },
-                                    isMine = isMine
-                                )
-                            } else {
-                                Text(
-                                    text = msg.text,
-                                    style = MaterialTheme.typography.bodyLarge.copy(
-                                        color = if (isMine) Color.White else MaterialTheme.colorScheme.onSurface,
-                                        fontSize = 14.sp
-                                    )
-                                )
-                            }
 
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = msg.timestamp,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 9.sp,
-                                    color = if (isMine) Color.White.copy(alpha = 0.7f) else Color.Gray
-                                ),
-                                modifier = Modifier.align(Alignment.End)
-                            )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(
+                                    modifier = Modifier.align(Alignment.End),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = msg.timestamp,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 9.sp,
+                                            color = if (isMine) Color.White.copy(alpha = 0.7f) else Color.Gray
+                                        )
+                                    )
+                                    if (isMine) {
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        when {
+                                            msg.status == "sending" -> {
+                                                Icon(
+                                                    imageVector = Icons.Default.Schedule,
+                                                    contentDescription = "Sending",
+                                                    tint = Color.White.copy(alpha = 0.7f),
+                                                    modifier = Modifier.size(12.dp)
+                                                )
+                                            }
+                                            msg.status == "read" || msg.readAt != null -> {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.DoneAll,
+                                                        contentDescription = "Read",
+                                                        tint = Color(0xFF60A5FA), // Light blue checkmark
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(2.dp))
+                                                    Text(
+                                                        text = "Read",
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            fontSize = 8.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = Color(0xFF93C5FD)
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                            msg.status == "delivered" || msg.deliveredAt != null -> {
+                                                Icon(
+                                                    imageVector = Icons.Default.DoneAll,
+                                                    contentDescription = "Delivered",
+                                                    tint = Color.White.copy(alpha = 0.9f),
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                            else -> { // sent
+                                                Icon(
+                                                    imageVector = Icons.Default.Done,
+                                                    contentDescription = "Sent",
+                                                    tint = Color.White.copy(alpha = 0.8f),
+                                                    modifier = Modifier.size(12.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+                }
+            }
+
+            // New messages floating indicator button
+            if (showNewMessageBadge) {
+                Button(
+                    onClick = {
+                        showNewMessageBadge = false
+                        coroutineScope.launch {
+                            listState.animateScrollToItem((messages.size - 1).coerceAtLeast(0))
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AuraPink),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 12.dp)
+                        .testTag("new_messages_scroll_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.KeyboardArrowDown,
+                        contentDescription = "Scroll to bottom",
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("New messages", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 }
             }
         }
@@ -322,7 +462,10 @@ fun ChatDetailScreen(
 
                 OutlinedTextField(
                     value = messageText,
-                    onValueChange = { messageText = it },
+                    onValueChange = {
+                        messageText = it
+                        onTyping()
+                    },
                     placeholder = { Text("Message...") },
                     modifier = Modifier
                         .weight(1f)

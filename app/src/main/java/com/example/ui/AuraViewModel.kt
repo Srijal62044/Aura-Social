@@ -304,22 +304,14 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Periodic check for incoming calls and active call updates
+        // Realtime subscription for incoming calls
         viewModelScope.launch {
-            while (true) {
-                kotlinx.coroutines.delay(1200)
-                val current = _currentUsername.value
-                if (current.isNotBlank()) {
-                    val activeState = _callState.value
-                    if (!activeState.isActive) {
-                        val callerProfile = currentUser.value ?: repository.getUserDirect(current)
-                        var callerUuid = callerProfile?.id.orEmpty()
-                        if (callerUuid.isBlank()) {
-                            callerUuid = repository.getCurrentUserAuthId().orEmpty()
-                        }
-                        if (callerUuid.isNotBlank()) {
-                            val pendingCall = repository.getPendingIncomingCall(callerUuid)
-                            if (pendingCall != null && pendingCall.status == "ringing") {
+            _currentUser.collect { user ->
+                val userUuid = user?.id ?: repository.getCurrentUserAuthId().orEmpty()
+                if (userUuid.isNotBlank()) {
+                    repository.startIncomingCallRealtimeListener(userUuid, viewModelScope) { pendingCall ->
+                        if (!_callState.value.isActive && pendingCall.status == "ringing") {
+                            viewModelScope.launch {
                                 val callerUser = repository.getUserByUuid(pendingCall.callerId)
                                 val peerName = callerUser?.username ?: "Caller"
                                 _callState.value = CallState(
@@ -327,7 +319,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                                     callId = pendingCall.id,
                                     roomName = pendingCall.roomName,
                                     callerId = pendingCall.callerId,
-                                    receiverId = callerUuid,
+                                    receiverId = userUuid,
                                     peerUsername = peerName,
                                     peerAvatar = callerUser?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
                                     isVideo = pendingCall.callType == "video",
@@ -337,10 +329,9 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                                 observeActiveCallStatus(pendingCall.id)
                             }
                         }
-                    } else if (activeState.status == "connecting" && liveKitManager.isConnected.value) {
-                        _callState.value = activeState.copy(status = "connected")
-                        startDurationTimer()
                     }
+                } else {
+                    repository.stopIncomingCallRealtimeListener()
                 }
             }
         }
@@ -432,6 +423,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun selectUserProfile(username: String) {
         if (username.equals(_currentUsername.value, ignoreCase = true)) {
             _currentScreen.value = AuraScreen.PROFILE
+            currentUser.value?.let { refreshProfileFollowData(it.username) }
             return
         }
         _selectedUsername.value = username
@@ -446,6 +438,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 )
             _selectedUserProfile.value = profile
             _currentScreen.value = AuraScreen.USER_PROFILE
+            refreshProfileFollowData(username)
         }
     }
 
@@ -570,6 +563,9 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val _typingPeerUsername = MutableStateFlow<String?>(null)
     val typingPeerUsername: StateFlow<String?> = _typingPeerUsername.asStateFlow()
 
+    private val _isConversationLoading = MutableStateFlow(false)
+    val isConversationLoading: StateFlow<Boolean> = _isConversationLoading.asStateFlow()
+
     private var messagePollingJob: Job? = null
     private var typingPollingJob: Job? = null
     private var typingDebounceJob: Job? = null
@@ -583,17 +579,28 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val current = _currentUsername.value
         _selectedConversationId.value = username
         _currentScreen.value = AuraScreen.CHAT_DETAIL
+        _isConversationLoading.value = true
 
         messagePollingJob?.cancel()
         typingPollingJob?.cancel()
 
         viewModelScope.launch {
             if (current.isNotBlank()) {
+                val user1 = repository.getUserDirect(current)
+                val user2 = repository.getUserDirect(username)
+                val id1 = user1?.id?.takeIf { it.isNotBlank() } ?: repository.supabase.getCurrentUserAuthId()
+                val id2 = user2?.id?.takeIf { it.isNotBlank() } ?: repository.getUserDirect(username)?.id
+
+                if (!id1.isNullOrBlank() && !id2.isNullOrBlank()) {
+                    repository.supabase.getOrCreateDirectConversation(id1, id2)
+                }
+
                 repository.markMessagesAsRead(current, username)
                 repository.fetchMessages(current, username)
                 val newCounts = repository.getUnreadCounts(current)
                 _unreadCountsPerConversation.value = newCounts
             }
+            _isConversationLoading.value = false
         }
 
         // Active conversation realtime message sync loop
@@ -653,7 +660,17 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendMessage(text: String, mediaUrl: String = "", type: String = "text") {
+    fun updateOnlineStatus(isOnline: Boolean) {
+        val user = _currentUser.value
+        val userId = user?.id.takeIf { !it.isNullOrBlank() } ?: sessionManager.getSessionUserId()
+        if (!userId.isNullOrBlank()) {
+            viewModelScope.launch {
+                repository.updateOnlineStatus(userId, isOnline)
+            }
+        }
+    }
+
+    fun sendMessage(text: String, mediaUrl: String = "", type: String = "text", onResult: ((Boolean, String) -> Unit)? = null) {
         val recipient = _selectedConversationId.value ?: return
         if (text.isBlank() && mediaUrl.isBlank()) return
         val sender = _currentUsername.value
@@ -663,7 +680,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         typingDebounceJob?.cancel()
         viewModelScope.launch {
             repository.sendTypingStatus(recipient, sender, false)
-            repository.sendMessage(
+            val (success, errMsg) = repository.sendMessage(
                 MessageEntity(
                     conversationId = recipient,
                     senderUsername = sender,
@@ -673,11 +690,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     mediaUrl = mediaUrl,
                     type = type,
                     isMine = true,
-                    status = "sending",
                     timestamp = "Just now"
                 )
             )
-            repository.fetchMessages(sender, recipient)
+            if (success) {
+                repository.fetchMessages(sender, recipient)
+                onResult?.invoke(true, "")
+            } else {
+                showFeedback(errMsg)
+                onResult?.invoke(false, errMsg)
+            }
         }
     }
 
@@ -705,57 +727,46 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
             val receiverProfile = repository.getUserDirect(peerUsername)
             val receiverUuid = receiverProfile?.id.orEmpty()
+            val callType = if (isVideo) "video" else "audio"
 
-            Log.d("AuraCall", "startCall: callerUuid=$callerUuid, receiverUuid=$receiverUuid")
+            Log.d("CALL_BUTTON_CLICKED", "callerId=$callerUuid\nreceiverId=$receiverUuid\ncallType=$callType")
 
             if (callerUuid.isBlank()) {
-                val msg = "Please sign in again."
-                _callState.value = CallState(
-                    isActive = true,
-                    status = "failed",
-                    errorMessage = msg
-                )
+                showFeedback("Call error: Please sign in again.")
                 return@launch
             }
 
             if (receiverUuid.isBlank()) {
-                val msg = "Unable to locate receiver profile ID."
-                _callState.value = CallState(
-                    isActive = true,
-                    status = "failed",
-                    errorMessage = msg
-                )
+                showFeedback("Call error: Unable to locate receiver profile ID.")
                 return@launch
             }
 
             val callId = java.util.UUID.randomUUID().toString()
             val roomName = "call_${callId.take(8)}"
 
-            _callState.value = CallState(
-                isActive = true,
-                callId = callId,
-                roomName = roomName,
-                callerId = callerUuid,
-                receiverId = receiverUuid,
-                peerUsername = peerUsername,
-                peerAvatar = receiverProfile?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
-                isVideo = isVideo,
-                status = "initiating",
-                isIncoming = false
-            )
-
             val (created, errorMsg) = repository.createCallRecordEx(
                 callerUuid = callerUuid,
                 receiverUuid = receiverUuid,
                 roomId = roomName,
-                callType = if (isVideo) "video" else "audio"
+                callType = callType
             )
 
             if (created) {
-                _callState.value = _callState.value.copy(status = "ringing")
+                _callState.value = CallState(
+                    isActive = true,
+                    callId = callId,
+                    roomName = roomName,
+                    callerId = callerUuid,
+                    receiverId = receiverUuid,
+                    peerUsername = peerUsername,
+                    peerAvatar = receiverProfile?.avatarUrl?.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" } ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500",
+                    isVideo = isVideo,
+                    status = "ringing",
+                    isIncoming = false
+                )
                 observeActiveCallStatus(callId)
             } else {
-                _callState.value = _callState.value.copy(status = "failed", errorMessage = errorMsg)
+                showFeedback(errorMsg)
             }
         }
     }
@@ -886,14 +897,32 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
+    private val _searchResults = MutableStateFlow<List<UserEntity>>(emptyList())
+    val searchResults: StateFlow<List<UserEntity>> = _searchResults.asStateFlow()
+
+    fun refreshSearchUsers() {
+        viewModelScope.launch {
+            try {
+                val query = _searchQuery.value
+                val results = repository.searchUsersRemote(query)
+                _searchResults.value = results
+                repository.fetchUsers(_currentUsername.value)
+            } catch (e: Exception) {
+                Log.e("AuraViewModel", "Error refreshing search users: ${e.localizedMessage}", e)
+            }
+        }
+    }
+
     fun updateSearchQuery(query: String) {
         _searchQuery.value = query
+        refreshSearchUsers()
     }
 
     fun performSearch(query: String) {
         if (query.isNotBlank()) {
             viewModelScope.launch {
                 repository.addSearchQuery(query)
+                refreshSearchUsers()
             }
         }
     }
@@ -1042,32 +1071,172 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // FOLLOW / RELATIONSHIP
-    fun toggleFollowUser(username: String) {
-        viewModelScope.launch {
-            val current = _currentUsername.value
-            val user = currentUser.value
-            if (current.isBlank() || current == username) return@launch
+    // FOLLOW / RELATIONSHIP STATE
+    private val _isFollowLoading = MutableStateFlow(false)
+    val isFollowLoading: StateFlow<Boolean> = _isFollowLoading.asStateFlow()
 
-            repository.toggleFollowUser(username, current)
-            val updated = repository.getUserDirect(username)
-            if (updated != null) {
-                if (_selectedUsername.value == username) {
-                    _selectedUserProfile.value = updated
+    private val _followersList = MutableStateFlow<List<UserEntity>?>(null)
+    val followersList: StateFlow<List<UserEntity>?> = _followersList.asStateFlow()
+
+    private val _followingList = MutableStateFlow<List<UserEntity>?>(null)
+    val followingList: StateFlow<List<UserEntity>?> = _followingList.asStateFlow()
+
+    private val _isLoadingFollowList = MutableStateFlow(false)
+    val isLoadingFollowList: StateFlow<Boolean> = _isLoadingFollowList.asStateFlow()
+
+    private val _activeFollowListType = MutableStateFlow<String?>(null) // "followers", "following", or null
+    val activeFollowListType: StateFlow<String?> = _activeFollowListType.asStateFlow()
+
+    fun refreshProfileFollowData(profileUsername: String) {
+        viewModelScope.launch {
+            val currentAuthId = repository.getCurrentUserAuthId().orEmpty()
+            val targetUser = repository.getUserDirect(profileUsername) ?: return@launch
+            val targetId = targetUser.id
+            if (targetId.isBlank()) return@launch
+
+            val followerCount = repository.getFollowerCount(targetId)
+            val followingCount = repository.getFollowingCount(targetId)
+            val followStatus = if (currentAuthId.isNotBlank() && currentAuthId != targetId) {
+                repository.getFollowStatus(currentAuthId, targetId)
+            } else {
+                "none"
+            }
+
+            val updatedUser = targetUser.copy(
+                followerCount = followerCount,
+                followingCount = followingCount,
+                followStatus = followStatus
+            )
+
+            if (_selectedUsername.value.equals(profileUsername, ignoreCase = true)) {
+                _selectedUserProfile.value = updatedUser
+            }
+            val currentUserVal = currentUser.value
+            if (currentUserVal?.id == targetId || currentUserVal?.username.equals(profileUsername, ignoreCase = true)) {
+                _currentUser.value = updatedUser
+            }
+        }
+    }
+
+    fun openFollowersList(profileId: String) {
+        viewModelScope.launch {
+            _activeFollowListType.value = "followers"
+            _followersList.value = null
+            _isLoadingFollowList.value = true
+            val list = repository.getFollowersList(profileId)
+            _followersList.value = list
+            _isLoadingFollowList.value = false
+        }
+    }
+
+    fun openFollowingList(profileId: String) {
+        viewModelScope.launch {
+            _activeFollowListType.value = "following"
+            _followingList.value = null
+            _isLoadingFollowList.value = true
+            val list = repository.getFollowingList(profileId)
+            _followingList.value = list
+            _isLoadingFollowList.value = false
+        }
+    }
+
+    fun closeFollowList() {
+        _activeFollowListType.value = null
+        _followersList.value = null
+        _followingList.value = null
+        _isLoadingFollowList.value = false
+    }
+
+    // FOLLOW / RELATIONSHIP
+    fun toggleFollowUser(targetUsername: String) {
+        viewModelScope.launch {
+            if (_isFollowLoading.value) return@launch // Prevent duplicate taps while loading
+
+            val currentAuthId = repository.getCurrentUserAuthId().orEmpty()
+            val currentUserVal = currentUser.value
+            val targetUser = repository.getUserDirect(targetUsername)
+
+            if (targetUser == null) {
+                showFeedback("Error: Target profile not found.")
+                return@launch
+            }
+
+            val targetId = targetUser.id
+            val currentId = if (currentAuthId.isNotBlank()) currentAuthId else (currentUserVal?.id ?: "")
+
+            if (currentId.isBlank() || targetId.isBlank()) {
+                showFeedback("Error: User authentication or profile ID missing.")
+                return@launch
+            }
+
+            if (currentId == targetId) {
+                showFeedback("You cannot follow yourself.")
+                return@launch
+            }
+
+            _isFollowLoading.value = true
+
+            // Call Supabase DB toggleFollow
+            val (success, errorOrStatus) = repository.toggleFollowUserEx(currentId, targetId)
+
+            if (!success) {
+                // Show error visibly to user
+                showFeedback(errorOrStatus)
+                refreshProfileFollowData(targetUsername)
+                if (currentUserVal != null) {
+                    refreshProfileFollowData(currentUserVal.username)
                 }
-                if (updated.followStatus == "following" || updated.followStatus == "requested") {
-                    repository.addNotification(
-                        NotificationEntity(
-                            recipientUsername = username,
-                            actorUsername = current,
-                            actorAvatar = user?.avatarUrl ?: "",
-                            type = if (updated.followStatus == "requested") "follow_request" else "follow",
-                            text = if (updated.followStatus == "requested") "requested to follow you." else "started following you.",
-                            timestamp = "Just now"
-                        )
-                    )
+                _isFollowLoading.value = false
+                return@launch
+            }
+
+            // Fetch exact counts & follow status directly from public.follows
+            val realTargetFollowerCount = repository.getFollowerCount(targetId)
+            val realTargetFollowingCount = repository.getFollowingCount(targetId)
+            val realFollowStatus = repository.getFollowStatus(currentId, targetId).let {
+                if (it == "none" && errorOrStatus == "following") "following" else it
+            }
+
+            val updatedTarget = targetUser.copy(
+                followStatus = realFollowStatus,
+                followerCount = realTargetFollowerCount,
+                followingCount = realTargetFollowingCount
+            )
+            _selectedUserProfile.value = updatedTarget
+
+            val myUsername = _currentUsername.value
+            if (currentUserVal != null) {
+                val realCurrentFollowerCount = repository.getFollowerCount(currentUserVal.id)
+                val realCurrentFollowingCount = repository.getFollowingCount(currentUserVal.id)
+                _currentUser.value = currentUserVal.copy(
+                    followerCount = realCurrentFollowerCount,
+                    followingCount = realCurrentFollowingCount
+                )
+            }
+
+            // Refresh Followers list & Following list if open or cached
+            if (_activeFollowListType.value == "followers") {
+                openFollowersList(targetId)
+            } else if (_activeFollowListType.value == "following") {
+                openFollowingList(targetId)
+            } else {
+                if (_followersList.value != null) {
+                    _followersList.value = repository.getFollowersList(targetId)
+                }
+                if (_followingList.value != null) {
+                    _followingList.value = repository.getFollowingList(targetId)
                 }
             }
+
+            // Refresh Message tab / User list
+            if (myUsername.isNotBlank()) {
+                repository.fetchUsers(myUsername)
+            }
+
+            val feedbackMsg = if (realFollowStatus == "following") "Now following @$targetUsername" else "Unfollowed @$targetUsername"
+            showFeedback(feedbackMsg)
+
+            _isFollowLoading.value = false
         }
     }
 
@@ -1169,41 +1338,110 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     fun login(identifier: String, p: String) {
         viewModelScope.launch {
-            _authLoading.value = true
-            _authError.value = null
-            val (user, msg) = repository.loginUser(identifier, p)
-            _authLoading.value = false
-            if (user != null) {
-                val token = repository.getUserToken() ?: ""
-                sessionManager.saveSession(user.id, token, user.username)
-                _currentUsername.value = user.username
-                _currentUser.value = user
-                _authState.value = AuthState.LOGGED_IN
-                _currentScreen.value = AuraScreen.HOME
-                showFeedback("Welcome back, ${user.fullName}!")
-            } else {
-                _authError.value = msg
+            try {
+                _authLoading.value = true
+                _authError.value = null
+
+                val cleanEmail = identifier.trim()
+                if (cleanEmail.isBlank() || p.isBlank()) {
+                    _authError.value = "Please enter your email and password."
+                    return@launch
+                }
+
+                android.util.Log.d("AuraViewModel", "LOGIN_BUTTON_CLICKED: $cleanEmail")
+
+                val (authUser, msg) = repository.loginUser(cleanEmail, p)
+
+                android.util.Log.d(
+                    "AuraViewModel",
+                    "LOGIN_RESPONSE: userId=${authUser?.id}, hasSession=${!repository.getUserToken().isNullOrBlank()}, error=$msg"
+                )
+
+                if (authUser != null) {
+                    val token = repository.getUserToken() ?: ""
+                    // Save temporary session first to allow immediate access if needed
+                    sessionManager.saveSession(authUser.id, token, authUser.username)
+                    _currentUsername.value = authUser.username
+                    _currentUser.value = authUser
+
+                    // Load the profile separately
+                    val (profile, profileErrorMsg) = repository.loadProfileForAuthUser(
+                        userId = authUser.id,
+                        email = authUser.email,
+                        token = token,
+                        userMetadata = null
+                    )
+
+                    _authState.value = AuthState.LOGGED_IN
+                    val activeUser = profile ?: authUser
+                    sessionManager.saveSession(activeUser.id, token, activeUser.username)
+                    _currentUsername.value = activeUser.username
+                    _currentUser.value = activeUser
+                    _currentScreen.value = AuraScreen.HOME
+                    showFeedback("Welcome back, ${activeUser.fullName}!")
+                } else {
+                    _authError.value = msg
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("AuraViewModel", "LOGIN_FAILED", e)
+                _authError.value = e.localizedMessage ?: "Unable to log in. Please check your email and password."
+            } finally {
+                _authLoading.value = false
             }
         }
     }
 
     fun loginWithGoogleToken(accessToken: String) {
         viewModelScope.launch {
-            _authLoading.value = true
-            _authError.value = null
-            val (user, msg) = repository.loginWithToken(accessToken)
-            _authLoading.value = false
-            if (user != null) {
-                val token = repository.getUserToken() ?: ""
-                sessionManager.saveSession(user.id, token, user.username)
-                _currentUsername.value = user.username
-                _currentUser.value = user
-                _authState.value = AuthState.LOGGED_IN
-                _currentScreen.value = AuraScreen.HOME
-                showFeedback("Welcome back, ${user.fullName}!")
-            } else {
-                _authError.value = msg
-                showFeedback("Google Sign-In failed: $msg")
+            try {
+                _authLoading.value = true
+                _authError.value = null
+
+                android.util.Log.d("AuraViewModel", "GOOGLE_SIGNIN_CLICKED")
+
+                val (authUser, msg) = repository.loginWithToken(accessToken)
+
+                android.util.Log.d(
+                    "AuraViewModel",
+                    "GOOGLE_SIGNIN_RESPONSE: userId=${authUser?.id}, hasSession=${!repository.getUserToken().isNullOrBlank()}, error=$msg"
+                )
+
+                if (authUser != null) {
+                    val token = repository.getUserToken() ?: ""
+                    sessionManager.saveSession(authUser.id, token, authUser.username)
+                    _currentUsername.value = authUser.username
+                    _currentUser.value = authUser
+
+                    // Load/create the profile separately
+                    val (profile, profileErrorMsg) = repository.loadProfileForAuthUser(
+                        userId = authUser.id,
+                        email = authUser.email,
+                        token = token,
+                        userMetadata = null
+                    )
+
+                    _authState.value = AuthState.LOGGED_IN
+                    if (profile != null) {
+                        sessionManager.saveSession(profile.id, token, profile.username)
+                        _currentUsername.value = profile.username
+                        _currentUser.value = profile
+                        _currentScreen.value = AuraScreen.HOME
+                        showFeedback("Welcome back, ${profile.fullName}!")
+                    } else {
+                        _currentScreen.value = AuraScreen.EDIT_PROFILE
+                        _authError.value = profileErrorMsg ?: "Profile query returned null."
+                        showFeedback("Profile setup required.")
+                    }
+                    refreshSearchUsers()
+                } else {
+                    _authError.value = msg
+                    showFeedback("Google Sign-In failed: $msg")
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("AuraViewModel", "GOOGLE_SIGNIN_FAILED", e)
+                _authError.value = e.localizedMessage ?: "Google Sign-In failed."
+            } finally {
+                _authLoading.value = false
             }
         }
     }
@@ -1238,6 +1476,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 _authState.value = AuthState.LOGGED_IN
                 _currentScreen.value = AuraScreen.HOME
                 showFeedback("Account created! Welcome to Aura, ${registeredUser.fullName}.")
+                refreshSearchUsers()
             } else {
                 _authError.value = msg
             }

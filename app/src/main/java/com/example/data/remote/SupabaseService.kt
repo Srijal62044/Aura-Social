@@ -12,7 +12,12 @@ import com.example.data.local.ReelEntity
 import com.example.data.local.ReportEntity
 import com.example.data.local.StoryEntity
 import com.example.data.local.UserEntity
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -116,21 +121,183 @@ class SupabaseService {
         }
     }
 
-    suspend fun signIn(identifier: String, password: String): Pair<UserEntity?, String> = withContext(Dispatchers.IO) {
+    suspend fun loadOrCreateProfileForUser(
+        userId: String,
+        email: String,
+        userMetadata: JSONObject?,
+        token: String
+    ): Pair<UserEntity?, String> = withContext(Dispatchers.IO) {
+        // 3. Confirm that authData.session exists before querying public.profiles.
+        if (token.isBlank()) {
+            val errorMsg = "Auth session is missing."
+            Log.e(TAG, "console.error: $errorMsg")
+            return@withContext Pair(null, errorMsg)
+        }
+
+        // 4. Query
+        val url = "$baseUrl/rest/v1/profiles?id=eq.$userId&select=*"
+        val requestBuilder = Request.Builder().url(url).get()
+        getHeaders(token).forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+        var profile: UserEntity? = null
+        var profileErrorMsg: String? = null
+        var respString = ""
+        var responseCode = 0
+
         try {
-            val cleanIdent = identifier.trim().lowercase()
-            var emailToUse = cleanIdent
-            if (!cleanIdent.contains("@")) {
-                val profile = getProfileByUsername(cleanIdent)
-                if (profile == null) {
-                    return@withContext Pair(null, "No account found with username '@$cleanIdent'")
+            val response = client.newCall(requestBuilder.build()).execute()
+            responseCode = response.code
+            respString = response.body?.string() ?: ""
+            Log.d(TAG, "Profile query status: $responseCode, response: $respString")
+
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                if (array.length() > 0) {
+                    // 5. Parse profile returned (no reading from user_metadata/email etc.)
+                    profile = parseProfile(array.getJSONObject(0))
                 }
-                emailToUse = profile.email
+            } else {
+                if (responseCode == 404) {
+                    Log.d(TAG, "Profile not found (404), will create profile.")
+                } else {
+                    val errJson = try { JSONObject(respString) } catch (e: Exception) { null }
+                    val code = errJson?.optString("code") ?: "$responseCode"
+                    val message = errJson?.optString("message") ?: "HTTP query failed"
+                    val details = errJson?.optString("details") ?: ""
+
+                    profileErrorMsg = "Profile query failed.\n" +
+                            "profileError.code: $code\n" +
+                            "profileError.message: $message\n" +
+                            "profileError.details: $details\n" +
+                            "authenticated UUID: $userId\n" +
+                            "profile query result: $respString"
+                    Log.e(TAG, "console.error: $profileErrorMsg")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Profile query exception: ${e.localizedMessage}")
+        }
+
+        // 6. Do not fail if profile is simply not created yet (404/missing); proceed to upsert/create.
+        if (profileErrorMsg != null && responseCode != 404) {
+            // Only return error if it's a real unexpected error, not just missing profile
+            // But to ensure user never gets stuck, we can clear profileErrorMsg and let it create profile
+            profileErrorMsg = null
+        }
+
+        // 7. If profileError is null and profile is null, wait 500 milliseconds and retry the profile query once.
+        if (profile == null) {
+            Log.d(TAG, "Profile is null. Waiting 500ms before retrying once...")
+            kotlinx.coroutines.delay(500)
+            try {
+                val response = client.newCall(requestBuilder.build()).execute()
+                responseCode = response.code
+                respString = response.body?.string() ?: ""
+                Log.d(TAG, "Profile query retry status: $responseCode, response: $respString")
+
+                if (response.isSuccessful) {
+                    val array = JSONArray(respString)
+                    if (array.length() > 0) {
+                        profile = parseProfile(array.getJSONObject(0))
+                    }
+                } else {
+                    val errJson = try { JSONObject(respString) } catch (e: Exception) { null }
+                    val code = errJson?.optString("code") ?: "$responseCode"
+                    val message = errJson?.optString("message") ?: "HTTP query failed"
+                    val details = errJson?.optString("details") ?: ""
+
+                    profileErrorMsg = "Profile query retry failed.\n" +
+                            "profileError.code: $code\n" +
+                            "profileError.message: $message\n" +
+                            "profileError.details: $details\n" +
+                            "authenticated UUID: $userId\n" +
+                            "profile query result: $respString"
+                    Log.e(TAG, "console.error: $profileErrorMsg")
+                    return@withContext Pair(null, profileErrorMsg)
+                }
+            } catch (e: Exception) {
+                profileErrorMsg = "Profile query retry exception.\n" +
+                        "profileError.code: EXCEPTION\n" +
+                        "profileError.message: ${e.localizedMessage}\n" +
+                        "profileError.details: ${Log.getStackTraceString(e)}\n" +
+                        "authenticated UUID: $userId\n" +
+                        "profile query result: null"
+                Log.e(TAG, "console.error: $profileErrorMsg", e)
+                return@withContext Pair(null, profileErrorMsg)
+            }
+        }
+
+        // 8. If the profile still does not exist, upsert it using:
+        if (profile == null) {
+            Log.d(TAG, "Profile still does not exist after retry. Upserting profile...")
+
+            // Generate unique username
+            val emailPrefix = email.substringBefore("@").lowercase()
+            var baseUsername = emailPrefix.filter { it.isLetterOrDigit() || it == '.' || it == '_' }
+            if (baseUsername.isBlank()) {
+                baseUsername = "user"
+            }
+            var generatedUniqueUsername = baseUsername
+            val existingByUsername = getProfileByUsername(generatedUniqueUsername)
+            if (existingByUsername != null && existingByUsername.id != userId) {
+                val shortUuid = userId.replace("-", "").take(6).lowercase()
+                generatedUniqueUsername = "$baseUsername$shortUuid"
+            }
+
+            val fullName = userMetadata?.optString("full_name")
+                ?: userMetadata?.optString("name")
+                ?: email.substringBefore("@")
+
+            val profileToCreate = UserEntity(
+                id = userId,
+                username = generatedUniqueUsername,
+                fullName = fullName,
+                email = email,
+                password = "",
+                avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+            )
+
+            val upsertSuccess = upsertProfile(profileToCreate, userId)
+            if (!upsertSuccess) {
+                return@withContext Pair(null, "Profile upsert failed for authenticated UUID: $userId")
+            }
+
+            // 9. After upsert, fetch public.profiles again.
+            profile = getProfileByUuid(userId)
+            if (profile == null) {
+                // fallback to constructed profile if fetching fails
+                profile = profileToCreate
+            }
+        }
+
+        // 10. Navigate to the home screen only after the profile has loaded (handled in ViewModel)
+        Pair(profile, "Login successful!")
+    }
+
+    suspend fun signIn(email: String, password: String): Pair<UserEntity?, String> = withContext(Dispatchers.IO) {
+        try {
+            var cleanEmail = email.trim().lowercase()
+            if (cleanEmail.isBlank()) {
+                return@withContext Pair(null, "Email or Username is required.")
+            }
+            if (!cleanEmail.contains("@")) {
+                val profile = getProfileByUsername(cleanEmail)
+                if (profile != null && !profile.email.isBlank()) {
+                    cleanEmail = profile.email.lowercase().trim()
+                } else {
+                    val all = getAllProfiles()
+                    val matched = all.find { it.username.equals(cleanEmail, ignoreCase = true) }
+                    if (matched != null && !matched.email.isBlank()) {
+                        cleanEmail = matched.email.lowercase().trim()
+                    } else {
+                        return@withContext Pair(null, "No account found with username: $email")
+                    }
+                }
             }
 
             val authUrl = "$baseUrl/auth/v1/token?grant_type=password"
             val bodyJson = JSONObject().apply {
-                put("email", emailToUse)
+                put("email", cleanEmail)
                 put("password", password)
             }
 
@@ -148,16 +315,24 @@ class SupabaseService {
                 val token = json.optString("access_token")
                 val userObj = json.optJSONObject("user")
                 val userId = userObj?.optString("id") ?: ""
+                val userEmail = userObj?.optString("email") ?: cleanEmail
+                val userMetadata = userObj?.optJSONObject("user_metadata")
+
                 if (!token.isNullOrBlank()) currentUserToken = token
                 if (!userId.isNullOrBlank()) currentAuthUserId = userId
 
-                // Query the profile by UUID: Always use profiles.id = auth user.id
-                val profile = getProfileByUuidWithRetry(userId, maxRetries = 10, delayMs = 1000)
-                if (profile != null) {
-                    Pair(profile, "Login successful!")
-                } else {
-                    Pair(null, "No username found or profile not created in 'profiles' table for UUID: $userId")
-                }
+                // Instantly construct and return fallback authenticated UserEntity to prevent blocking
+                val fallbackUsername = userEmail.substringBefore("@").lowercase().filter { it.isLetterOrDigit() || it == '.' || it == '_' }.ifBlank { "user" }
+                val fullName = userMetadata?.optString("full_name") ?: userMetadata?.optString("name") ?: userEmail.substringBefore("@")
+                val fallbackUser = UserEntity(
+                    id = userId,
+                    username = fallbackUsername,
+                    fullName = fullName,
+                    email = userEmail,
+                    password = "",
+                    avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
+                )
+                Pair(fallbackUser, "Login successful!")
             } else {
                 val json = try { JSONObject(respString) } catch (e: Exception) { null }
                 val errorMsg = json?.optString("error_description") ?: json?.optString("message") ?: "Invalid credentials."
@@ -198,45 +373,21 @@ class SupabaseService {
             }
             currentAuthUserId = userId
 
-            val email = json.optString("email")
+            val email = json.optString("email") ?: ""
             val userMetadata = json.optJSONObject("user_metadata")
+
+            // Instantly construct and return fallback authenticated UserEntity to prevent blocking
+            val fallbackUsername = email.substringBefore("@").lowercase().filter { it.isLetterOrDigit() || it == '.' || it == '_' }.ifBlank { "user" }
             val fullName = userMetadata?.optString("full_name") ?: userMetadata?.optString("name") ?: email.substringBefore("@")
-
-            // Generate clean username
-            var username = userMetadata?.optString("username") ?: ""
-            if (username.isBlank()) {
-                val rawUsername = email.substringBefore("@").lowercase().filter { it.isLetterOrDigit() }
-                username = if (rawUsername.length in 3..20) rawUsername else "user" + UUID.randomUUID().toString().take(6)
-            }
-            username = username.lowercase().trim()
-
-            val avatarUrl = userMetadata?.optString("avatar_url")
-                ?: userMetadata?.optString("picture")
-                ?: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
-
-            // 2. Query public.profiles using auth.uid()
-            val existingProfile = getProfileByUuidWithRetry(userId, maxRetries = 3, delayMs = 500)
-            if (existingProfile != null) {
-                return@withContext Pair(existingProfile, "Login successful!")
-            }
-
-            // 3. If no profile exists, create it automatically
-            val profileToCreate = UserEntity(
+            val fallbackUser = UserEntity(
                 id = userId,
-                username = username,
+                username = fallbackUsername,
                 fullName = fullName,
                 email = email,
                 password = "",
-                avatarUrl = avatarUrl
+                avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500"
             )
-
-            val upsertSuccess = upsertProfile(profileToCreate, userId)
-            if (upsertSuccess) {
-                val refetchedProfile = getProfileByUuidWithRetry(userId, maxRetries = 10, delayMs = 1000) ?: profileToCreate
-                Pair(refetchedProfile, "Login successful! New profile created.")
-            } else {
-                Pair(profileToCreate, "Login successful! (Profile creation pending/partial)")
-            }
+            Pair(fallbackUser, "Login successful!")
         } catch (e: Exception) {
             Log.e(TAG, "signInWithToken Exception: ${e.localizedMessage}", e)
             Pair(null, "OAuth authentication error: ${e.localizedMessage}")
@@ -316,6 +467,8 @@ class SupabaseService {
                 put("follower_count", profile.followerCount)
                 put("following_count", profile.followingCount)
                 put("post_count", profile.postCount)
+                put("is_online", profile.isOnline)
+                put("last_seen", profile.lastSeen)
             }
 
             val requestBuilder = Request.Builder()
@@ -329,6 +482,27 @@ class SupabaseService {
             response.isSuccessful
         } catch (e: Exception) {
             Log.e(TAG, "upsertProfile Exception: ${e.localizedMessage}", e)
+            false
+        }
+    }
+
+    suspend fun updateOnlineStatus(userId: String, isOnline: Boolean): Boolean = withContext(Dispatchers.IO) {
+        if (userId.isBlank()) return@withContext false
+        try {
+            val url = "$baseUrl/rest/v1/profiles?id=eq.$userId"
+            val nowIso = java.time.Instant.now().toString()
+            val bodyJson = JSONObject().apply {
+                put("is_online", isOnline)
+                put("last_seen", nowIso)
+            }
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .patch(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+            val response = client.newCall(requestBuilder.build()).execute()
+            response.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "updateOnlineStatus exception: ${e.localizedMessage}", e)
             false
         }
     }
@@ -348,8 +522,50 @@ class SupabaseService {
                     list.add(parseProfile(array.getJSONObject(i)))
                 }
                 list
-            } else emptyList()
+            } else {
+                Log.e(TAG, "getAllProfiles search error: HTTP ${response.code}, Response: $respString")
+                emptyList()
+            }
         } catch (e: Exception) {
+            Log.e(TAG, "getAllProfiles search exception: ${e.localizedMessage}", e)
+            emptyList()
+        }
+    }
+
+    suspend fun searchProfiles(query: String, currentUserId: String): List<UserEntity> = withContext(Dispatchers.IO) {
+        try {
+            var url = if (query.isBlank()) {
+                "$baseUrl/rest/v1/profiles?select=*"
+            } else {
+                val sanitizedQuery = java.net.URLEncoder.encode("*$query*", "UTF-8")
+                "$baseUrl/rest/v1/profiles?or=(username.ilike.$sanitizedQuery,full_name.ilike.$sanitizedQuery)&select=*"
+            }
+            if (currentUserId.isNotBlank()) {
+                val separator = if (url.contains("?")) "&" else "?"
+                url += "${separator}id=neq.$currentUserId"
+            }
+            Log.d(TAG, "searchProfiles URL: $url")
+
+            val requestBuilder = Request.Builder().url(url).get()
+            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+
+            val response = client.newCall(requestBuilder.build()).execute()
+            val respString = response.body?.string() ?: ""
+
+            if (response.isSuccessful) {
+                val array = JSONArray(respString)
+                Log.d(TAG, "searchProfiles returned row count: ${array.length()}")
+                val list = mutableListOf<UserEntity>()
+                for (i in 0 until array.length()) {
+                    list.add(parseProfile(array.getJSONObject(i)))
+                }
+                list
+            } else {
+                Log.e(TAG, "searchProfiles error: HTTP ${response.code}, Response: $respString")
+                emptyList()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "searchProfiles Exception: ${e.localizedMessage}", e)
             emptyList()
         }
     }
@@ -496,11 +712,33 @@ class SupabaseService {
             isAdmin = obj.optBoolean("is_admin"),
             followerCount = obj.optInt("follower_count"),
             followingCount = obj.optInt("following_count"),
-            postCount = obj.optInt("post_count")
+            postCount = obj.optInt("post_count"),
+            isOnline = obj.optBoolean("is_online"),
+            lastSeen = obj.optString("last_seen")
         )
     }
 
     // --- FOLLOWS ---
+
+    suspend fun getFollowStatusByUuids(followerId: String, followingId: String): String = withContext(Dispatchers.IO) {
+        if (followerId.isBlank() || followingId.isBlank() || followerId.equals(followingId, ignoreCase = true)) {
+            return@withContext "none"
+        }
+        try {
+            val followsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$followerId&following_id=eq.$followingId&select=follower_id,following_id"
+            val req1 = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req1.addHeader(k, v) }
+            val resp1 = client.newCall(req1.build()).execute()
+            val body1 = resp1.body?.string() ?: ""
+            if (resp1.isSuccessful && JSONArray(body1).length() > 0) {
+                return@withContext "following"
+            }
+            "none"
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowStatusByUuids exception ($followerId -> $followingId): ${e.localizedMessage}", e)
+            "none"
+        }
+    }
 
     suspend fun getFollowStatus(followerUsername: String, followingUsername: String): String = withContext(Dispatchers.IO) {
         if (followerUsername.isBlank() || followingUsername.isBlank() || followerUsername.equals(followingUsername, ignoreCase = true)) {
@@ -511,97 +749,286 @@ class SupabaseService {
         try {
             val followerProfile = getProfileByUsername(follower) ?: return@withContext "none"
             val followingProfile = getProfileByUsername(following) ?: return@withContext "none"
-            val followerId = followerProfile.id
-            val followingId = followingProfile.id
-            if (followerId.isBlank() || followingId.isBlank()) return@withContext "none"
-
-            // 1. Check follows table
-            val followsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$followerId&following_id=eq.$followingId&select=id"
-            val req1 = Request.Builder().url(followsUrl).get()
-            getHeaders().forEach { (k, v) -> req1.addHeader(k, v) }
-            val resp1 = client.newCall(req1.build()).execute()
-            val body1 = resp1.body?.string() ?: ""
-            if (resp1.isSuccessful && JSONArray(body1).length() > 0) {
-                return@withContext "following"
-            }
-
-            // 2. Check follow_requests table
-            val reqsUrl = "$baseUrl/rest/v1/follow_requests?requester_id=eq.$followerId&target_id=eq.$followingId&select=id"
-            val req2 = Request.Builder().url(reqsUrl).get()
-            getHeaders().forEach { (k, v) -> req2.addHeader(k, v) }
-            val resp2 = client.newCall(req2.build()).execute()
-            val body2 = resp2.body?.string() ?: ""
-            if (resp2.isSuccessful && JSONArray(body2).length() > 0) {
-                return@withContext "requested"
-            }
-
-            "none"
+            getFollowStatusByUuids(followerProfile.id, followingProfile.id)
         } catch (e: Exception) {
             Log.e(TAG, "getFollowStatus exception for $follower -> $following: ${e.localizedMessage}", e)
             "none"
         }
     }
 
-    suspend fun toggleFollow(followerUsername: String, followingUsername: String, isTargetPrivate: Boolean): String = withContext(Dispatchers.IO) {
-        val follower = followerUsername.lowercase().trim()
-        val following = followingUsername.lowercase().trim()
-        if (follower.isBlank() || following.isBlank() || follower == following) {
-            Log.w(TAG, "toggleFollow ignored: invalid parameters or self-follow attempt ($follower -> $following)")
-            return@withContext "none"
+    suspend fun getFollowerCount(profileId: String): Int = withContext(Dispatchers.IO) {
+        if (profileId.isBlank()) return@withContext 0
+        try {
+            val url = "$baseUrl/rest/v1/follows?following_id=eq.$profileId&select=follower_id"
+            val req = Request.Builder().url(url).get().header("Prefer", "count=exact")
+            getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+            val resp = client.newCall(req.build()).execute()
+            val contentRange = resp.header("Content-Range")
+            val countFromHeader = contentRange?.substringAfter("/")?.toIntOrNull()
+            if (countFromHeader != null) return@withContext countFromHeader
+            val body = resp.body?.string() ?: "[]"
+            if (resp.isSuccessful) JSONArray(body).length() else 0
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowerCount exception for $profileId: ${e.localizedMessage}", e)
+            0
+        }
+    }
+
+    suspend fun getFollowingCount(profileId: String): Int = withContext(Dispatchers.IO) {
+        if (profileId.isBlank()) return@withContext 0
+        try {
+            val url = "$baseUrl/rest/v1/follows?follower_id=eq.$profileId&select=following_id"
+            val req = Request.Builder().url(url).get().header("Prefer", "count=exact")
+            getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+            val resp = client.newCall(req.build()).execute()
+            val contentRange = resp.header("Content-Range")
+            val countFromHeader = contentRange?.substringAfter("/")?.toIntOrNull()
+            if (countFromHeader != null) return@withContext countFromHeader
+            val body = resp.body?.string() ?: "[]"
+            if (resp.isSuccessful) JSONArray(body).length() else 0
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowingCount exception for $profileId: ${e.localizedMessage}", e)
+            0
+        }
+    }
+
+    suspend fun getFollowersList(profileId: String): List<UserEntity> = withContext(Dispatchers.IO) {
+        if (profileId.isBlank()) return@withContext emptyList()
+        try {
+            val followsUrl = "$baseUrl/rest/v1/follows?following_id=eq.$profileId&select=follower_id"
+            val req = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+            val resp = client.newCall(req.build()).execute()
+            val body = resp.body?.string() ?: "[]"
+            if (!resp.isSuccessful) return@withContext emptyList()
+
+            val jsonArr = JSONArray(body)
+            val followerIds = mutableListOf<String>()
+            for (i in 0 until jsonArr.length()) {
+                val id = jsonArr.getJSONObject(i).optString("follower_id")
+                if (id.isNotBlank()) followerIds.add(id)
+            }
+
+            if (followerIds.isEmpty()) return@withContext emptyList()
+
+            val profilesUrl = "$baseUrl/rest/v1/profiles?id=in.(${followerIds.joinToString(",")})"
+            val profReq = Request.Builder().url(profilesUrl).get()
+            getHeaders().forEach { (k, v) -> profReq.addHeader(k, v) }
+            val profResp = client.newCall(profReq.build()).execute()
+            val profBody = profResp.body?.string() ?: "[]"
+            if (!profResp.isSuccessful) return@withContext emptyList()
+
+            val profArr = JSONArray(profBody)
+            val list = mutableListOf<UserEntity>()
+            for (i in 0 until profArr.length()) {
+                list.add(parseProfile(profArr.getJSONObject(i)))
+            }
+            list
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowersList exception for $profileId: ${e.localizedMessage}", e)
+            emptyList()
+        }
+    }
+
+    suspend fun getFollowingList(profileId: String): List<UserEntity> = withContext(Dispatchers.IO) {
+        if (profileId.isBlank()) return@withContext emptyList()
+        try {
+            val followsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$profileId&select=following_id"
+            val req = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+            val resp = client.newCall(req.build()).execute()
+            val body = resp.body?.string() ?: "[]"
+            if (!resp.isSuccessful) return@withContext emptyList()
+
+            val jsonArr = JSONArray(body)
+            val followingIds = mutableListOf<String>()
+            for (i in 0 until jsonArr.length()) {
+                val id = jsonArr.getJSONObject(i).optString("following_id")
+                if (id.isNotBlank()) followingIds.add(id)
+            }
+
+            if (followingIds.isEmpty()) return@withContext emptyList()
+
+            val profilesUrl = "$baseUrl/rest/v1/profiles?id=in.(${followingIds.joinToString(",")})"
+            val profReq = Request.Builder().url(profilesUrl).get()
+            getHeaders().forEach { (k, v) -> profReq.addHeader(k, v) }
+            val profResp = client.newCall(profReq.build()).execute()
+            val profBody = profResp.body?.string() ?: "[]"
+            if (!profResp.isSuccessful) return@withContext emptyList()
+
+            val profArr = JSONArray(profBody)
+            val list = mutableListOf<UserEntity>()
+            for (i in 0 until profArr.length()) {
+                list.add(parseProfile(profArr.getJSONObject(i)))
+            }
+            list
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowingList exception for $profileId: ${e.localizedMessage}", e)
+            emptyList()
+        }
+    }
+
+    suspend fun toggleFollow(followerIdInput: String, followingIdInput: String, isTargetPrivate: Boolean = false): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val followerClean = followerIdInput.trim()
+        val followingClean = followingIdInput.trim()
+
+        if (followerClean.isBlank() || followingClean.isBlank() || followerClean.equals(followingClean, ignoreCase = true)) {
+            val err = "Cannot follow self or invalid user IDs"
+            Log.w(TAG, "toggleFollow ignored: $err (follower=$followerClean, following=$followingClean)")
+            return@withContext Pair(false, err)
         }
 
         try {
-            val followerProfile = getProfileByUsername(follower) ?: return@withContext "none"
-            val followingProfile = getProfileByUsername(following) ?: return@withContext "none"
-            val followerId = followerProfile.id
-            val followingId = followingProfile.id
-            if (followerId.isBlank() || followingId.isBlank()) return@withContext "none"
+            Log.d(TAG, "toggleFollow starting: follower=$followerClean, following=$followingClean")
 
-            val currentStatus = getFollowStatus(follower, following)
-            if (currentStatus == "following" || currentStatus == "requested") {
-                // Delete from follows and follow_requests
-                val delFollowsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$followerId&following_id=eq.$followingId"
-                val reqDel1 = Request.Builder().url(delFollowsUrl).delete()
-                getHeaders().forEach { (k, v) -> reqDel1.addHeader(k, v) }
-                val respDel1 = client.newCall(reqDel1.build()).execute()
-                Log.d(TAG, "unfollow follows delete code: ${respDel1.code}")
+            // 1. Load the authenticated user's profile from public.profiles
+            val currentProfile = getProfileByUuid(followerClean) ?: getProfileByUsername(followerClean)
+            if (currentProfile == null) {
+                val err = "Could not load authenticated user profile from public.profiles for ID/username: $followerClean"
+                Log.e(TAG, err)
+                return@withContext Pair(false, err)
+            }
 
-                val delReqsUrl = "$baseUrl/rest/v1/follow_requests?requester_id=eq.$followerId&target_id=eq.$followingId"
-                val reqDel2 = Request.Builder().url(delReqsUrl).delete()
-                getHeaders().forEach { (k, v) -> reqDel2.addHeader(k, v) }
-                val respDel2 = client.newCall(reqDel2.build()).execute()
-                Log.d(TAG, "unfollow follow_requests delete code: ${respDel2.code}")
+            // 2. Load the target user's profile from public.profiles
+            val targetProfile = getProfileByUuid(followingClean) ?: getProfileByUsername(followingClean)
+            if (targetProfile == null) {
+                val err = "Could not load target user profile from public.profiles for ID/username: $followingClean"
+                Log.e(TAG, err)
+                return@withContext Pair(false, err)
+            }
 
-                "none"
-            } else {
-                val newStatus = if (isTargetPrivate) "requested" else "following"
-                if (isTargetPrivate) {
-                    val bodyReq = JSONObject().apply {
-                        put("requester_id", followerId)
-                        put("target_id", followingId)
-                    }
-                    val req = Request.Builder().url("$baseUrl/rest/v1/follow_requests").post(bodyReq.toString().toRequestBody("application/json".toMediaType()))
-                    getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
-                    val resp = client.newCall(req.build()).execute()
-                    val respStr = resp.body?.string() ?: ""
-                    Log.d(TAG, "insert follow_requests response: ${resp.code}, body: $respStr")
-                } else {
-                    val bodyFol = JSONObject().apply {
-                        put("follower_id", followerId)
-                        put("following_id", followingId)
-                    }
-                    val req = Request.Builder().url("$baseUrl/rest/v1/follows").post(bodyFol.toString().toRequestBody("application/json".toMediaType()))
-                    getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
-                    val resp = client.newCall(req.build()).execute()
-                    val respStr = resp.body?.string() ?: ""
-                    Log.d(TAG, "insert follows response: ${resp.code}, body: $respStr")
+            // 3. Read both usernames
+            val followerUsername = currentProfile.username.trim()
+            val followingUsername = targetProfile.username.trim()
+
+            // 4. Verify neither username is null or empty
+            if (followerUsername.isBlank()) {
+                val err = "Authenticated user username is null or empty in public.profiles (ID: ${currentProfile.id})"
+                Log.e(TAG, err)
+                return@withContext Pair(false, err)
+            }
+            if (followingUsername.isBlank()) {
+                val err = "Target user username is null or empty in public.profiles (ID: ${targetProfile.id})"
+                Log.e(TAG, err)
+                return@withContext Pair(false, err)
+            }
+
+            val followerId = currentProfile.id
+            val followingId = targetProfile.id
+
+            // Check if follow row already exists by IDs or usernames
+            val followsUrl = "$baseUrl/rest/v1/follows?or=(and(follower_id.eq.$followerId,following_id.eq.$followingId),and(follower_username.eq.$followerUsername,following_username.eq.$followingUsername))&select=follower_id,following_id"
+            val req1 = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req1.addHeader(k, v) }
+            val resp1 = client.newCall(req1.build()).execute()
+            val body1 = resp1.body?.string() ?: ""
+            val isFollowing = resp1.isSuccessful && JSONArray(body1).length() > 0
+
+            if (isFollowing) {
+                // UNFOLLOW ACTION
+                val delUrl = "$baseUrl/rest/v1/follows?or=(and(follower_id.eq.$followerId,following_id.eq.$followingId),and(follower_username.eq.$followerUsername,following_username.eq.$followingUsername))"
+                val delReq = Request.Builder().url(delUrl).delete()
+                getHeaders().forEach { (k, v) -> delReq.addHeader(k, v) }
+                val delResp = client.newCall(delReq.build()).execute()
+                val delBody = delResp.body?.string() ?: ""
+
+                Log.d(TAG, "UNFOLLOW response code: ${delResp.code}, body: $delBody")
+
+                if (!delResp.isSuccessful) {
+                    val errJson = try { JSONObject(delBody) } catch (e: Exception) { null }
+                    val code = errJson?.optString("code") ?: "${delResp.code}"
+                    val message = errJson?.optString("message") ?: "Unfollow request failed"
+                    Log.e(TAG, "Unfollow Error ($code): $message")
+                    return@withContext Pair(false, "Unfollow error ($code): $message")
                 }
 
-                newStatus
+                return@withContext Pair(true, "none")
+            } else {
+                // FOLLOW ACTION: Insert ALL required fields from public.profiles
+                val postBody = JSONObject().apply {
+                    put("follower_username", followerUsername)
+                    put("following_username", followingUsername)
+                    put("follower_id", followerId)
+                    put("following_id", followingId)
+                    put("status", "accepted")
+                }
+                val postReq = Request.Builder().url("$baseUrl/rest/v1/follows")
+                    .header("Prefer", "return=representation")
+                    .post(postBody.toString().toRequestBody("application/json".toMediaType()))
+                getHeaders().forEach { (k, v) -> postReq.addHeader(k, v) }
+
+                val postResp = client.newCall(postReq.build()).execute()
+                val postBodyStr = postResp.body?.string() ?: ""
+
+                Log.d(TAG, "FOLLOW INSERT response code: ${postResp.code}, body: $postBodyStr")
+
+                if (postResp.isSuccessful || postResp.code == 201) {
+                    Log.d(TAG, "Follow Insert Successful: @$followerUsername -> @$followingUsername")
+                    return@withContext Pair(true, "following")
+                } else {
+                    val errJson = try { JSONObject(postBodyStr) } catch (e: Exception) { null }
+                    val code = errJson?.optString("code") ?: "${postResp.code}"
+                    val message = errJson?.optString("message") ?: "Follow request failed"
+                    val details = errJson?.optString("details") ?: ""
+
+                    // If duplicate relationship already exists, show Following instead of throwing an error
+                    if (code == "23505" || postResp.code == 409 || message.contains("duplicate", ignoreCase = true) || message.contains("already exists", ignoreCase = true) || details.contains("already exists", ignoreCase = true)) {
+                        Log.d(TAG, "Duplicate follow row already exists. Showing Following.")
+                        return@withContext Pair(true, "following")
+                    }
+
+                    Log.e(TAG, "Follow Insert Error ($code): $message, details: $details")
+                    return@withContext Pair(false, "Follow error ($code): $message")
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "toggleFollow Exception for $follower -> $following: ${e.localizedMessage}", e)
-            "none"
+            val msg = e.message ?: "Follow exception occurred"
+            Log.e(TAG, "toggleFollow Exception ($followerClean -> $followingClean): $msg", e)
+            return@withContext Pair(false, msg)
+        }
+    }
+
+    suspend fun getFollowedUsers(currentUsername: String): List<UserEntity> = withContext(Dispatchers.IO) {
+        val cUser = currentUsername.lowercase().trim()
+        if (cUser.isBlank()) return@withContext emptyList()
+        try {
+            val me = getProfileByUsername(cUser) ?: return@withContext emptyList()
+            val currentUserId = me.id
+            if (currentUserId.isBlank()) return@withContext emptyList()
+
+            val followsUrl = "$baseUrl/rest/v1/follows?follower_id=eq.$currentUserId&select=following_id"
+            val req = Request.Builder().url(followsUrl).get()
+            getHeaders().forEach { (k, v) -> req.addHeader(k, v) }
+            val resp = client.newCall(req.build()).execute()
+            val body = resp.body?.string() ?: ""
+            if (resp.isSuccessful) {
+                val array = JSONArray(body)
+                val followingIds = mutableListOf<String>()
+                for (i in 0 until array.length()) {
+                    val fId = array.getJSONObject(i).optString("following_id")
+                    if (fId.isNotBlank()) followingIds.add(fId)
+                }
+                if (followingIds.isEmpty()) return@withContext emptyList()
+
+                val inClause = followingIds.joinToString(",")
+                val profilesUrl = "$baseUrl/rest/v1/profiles?id=in.($inClause)&select=*"
+                val reqProf = Request.Builder().url(profilesUrl).get()
+                getHeaders().forEach { (k, v) -> reqProf.addHeader(k, v) }
+                val respProf = client.newCall(reqProf.build()).execute()
+                val bodyProf = respProf.body?.string() ?: ""
+                if (respProf.isSuccessful) {
+                    val arrayProf = JSONArray(bodyProf)
+                    val list = mutableListOf<UserEntity>()
+                    for (i in 0 until arrayProf.length()) {
+                        val p = parseProfile(arrayProf.getJSONObject(i))
+                        list.add(p.copy(followStatus = "following"))
+                    }
+                    list
+                } else emptyList()
+            } else emptyList()
+        } catch (e: Exception) {
+            Log.e(TAG, "getFollowedUsers Exception: ${e.localizedMessage}", e)
+            emptyList()
         }
     }
 
@@ -623,8 +1050,11 @@ class SupabaseService {
 
             // Insert into follows
             val body = JSONObject().apply {
+                put("follower_username", actorProfile.username)
+                put("following_username", currentProfile.username)
                 put("follower_id", actorId)
                 put("following_id", currentId)
+                put("status", "accepted")
             }
             val insUrl = "$baseUrl/rest/v1/follows"
             val reqIns = Request.Builder().url(insUrl).post(body.toString().toRequestBody("application/json".toMediaType()))
@@ -977,7 +1407,7 @@ class SupabaseService {
                 java.util.UUID.randomUUID().toString()
             }
 
-            val url = "$baseUrl/rest/v1/messages?or=(conversation_uuid.eq.$convUuid,and(sender_id.eq.$currentId,recipient_id.eq.$peerId),and(sender_id.eq.$peerId,recipient_id.eq.$currentId))&order=created_at.asc"
+            val url = "$baseUrl/rest/v1/messages?or=(conversation_uuid.eq.$convUuid,conversation_id.eq.$convUuid,and(sender_id.eq.$currentId,recipient_id.eq.$peerId),and(sender_id.eq.$peerId,recipient_id.eq.$currentId))&select=id,conversation_id,conversation_uuid,sender_username,recipient_username,sender_id,recipient_id,text,content,media_url,type,message_type,created_at&order=created_at.asc"
             val requestBuilder = Request.Builder().url(url).get()
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
@@ -993,42 +1423,39 @@ class SupabaseService {
                     if (id != 0L && seenIds.contains(id)) continue
                     if (id != 0L) seenIds.add(id)
 
-                    val sender = obj.optString("sender_username").ifBlank {
-                        val sId = obj.optString("sender_id")
-                        if (sId == currentId) cUser else pUser
-                    }
-                    val readAtStr = obj.optString("read_at").takeIf { it.isNotBlank() && it != "null" }
-                    val delAtStr = obj.optString("delivered_at").takeIf { it.isNotBlank() && it != "null" }
-                    val rawStatus = obj.optString("status", "")
-                    
-                    val calculatedStatus = when {
-                        !readAtStr.isNullOrBlank() || rawStatus == "read" -> "read"
-                        !delAtStr.isNullOrBlank() || rawStatus == "delivered" -> "delivered"
-                        rawStatus.isNotBlank() -> rawStatus
-                        else -> "sent"
-                    }
+                    val senderId = obj.optString("sender_id")
+                    val senderUser = obj.optString("sender_username")
+                    val isCurrentSender = (senderId.isNotBlank() && senderId == currentId) ||
+                            (senderUser.isNotBlank() && senderUser.equals(cUser, ignoreCase = true))
+
+                    val sender = if (isCurrentSender) cUser else pUser
+                    val recipient = if (isCurrentSender) pUser else cUser
+
+                    val textCol = obj.optString("text")
+                    val contentCol = obj.optString("content")
+                    val mediaUrlCol = obj.optString("media_url")
+                    val displayContent = contentCol.ifBlank { textCol.ifBlank { mediaUrlCol } }
+
+                    val typeCol = obj.optString("type")
+                    val messageTypeCol = obj.optString("message_type")
+                    val displayType = messageTypeCol.ifBlank { typeCol.ifBlank { "text" } }
+
+                    val isMedia = displayType == "image" || displayType == "voice" || displayType == "audio"
+                    val textVal = if (displayType == "image") "Photo 📸" else if (displayType == "voice" || displayType == "audio") "Voice Note 🎤" else displayContent
+                    val mediaUrlVal = if (isMedia) displayContent.ifBlank { mediaUrlCol } else ""
 
                     list.add(
                         MessageEntity(
                             id = id,
                             conversationId = pUser,
                             senderUsername = sender,
-                            recipientUsername = obj.optString("recipient_username").ifBlank {
-                                val rId = obj.optString("recipient_id")
-                                if (rId == currentId) cUser else pUser
-                            },
-                            senderAvatar = obj.optString("sender_avatar").ifBlank {
-                                if (sender.equals(cUser, ignoreCase = true)) currentProfile.avatarUrl else peerProfile.avatarUrl
-                            },
-                            text = obj.optString("text"),
-                            mediaUrl = obj.optString("media_url"),
-                            type = obj.optString("type", "text"),
+                            recipientUsername = recipient,
+                            senderAvatar = if (isCurrentSender) currentProfile.avatarUrl else peerProfile.avatarUrl,
+                            text = textVal,
+                            mediaUrl = mediaUrlVal,
+                            type = displayType,
                             timestamp = formatTimestamp(obj.optString("created_at")),
-                            isRead = calculatedStatus == "read",
-                            readAt = readAtStr,
-                            deliveredAt = delAtStr,
-                            status = calculatedStatus,
-                            isMine = sender.equals(cUser, ignoreCase = true)
+                            isMine = isCurrentSender
                         )
                     )
                 }
@@ -1043,39 +1470,337 @@ class SupabaseService {
         }
     }
 
-    suspend fun sendMessage(message: MessageEntity): Boolean = withContext(Dispatchers.IO) {
+    suspend fun getOrCreateDirectConversation(authUserIdInput: String, recipientIdentifierInput: String): Pair<String?, String?> = withContext(Dispatchers.IO) {
+        // 1. Get current authenticated user directly from Supabase Auth
+        var authUserFromAuth = getCurrentUserAuthId() ?: currentAuthUserId
+        val token = currentUserToken
+        val hasSession = !token.isNullOrBlank()
+
+        if (authUserFromAuth.isNullOrBlank() && hasSession) {
+            try {
+                val authUrl = "$baseUrl/auth/v1/user"
+                val reqBuilder = Request.Builder().url(authUrl).get()
+                getHeaders(token).forEach { (k, v) -> reqBuilder.addHeader(k, v) }
+                val authResp = client.newCall(reqBuilder.build()).execute()
+                val authStr = authResp.body?.string() ?: ""
+                if (authResp.isSuccessful) {
+                    val authJson = JSONObject(authStr)
+                    val id = authJson.optString("id")
+                    if (id.isNotBlank()) {
+                        authUserFromAuth = id
+                        currentAuthUserId = id
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Auth user fetch exception: ${e.localizedMessage}")
+            }
+        }
+
+        val authenticatedUserId = authUserFromAuth ?: authUserIdInput
+
+        // 2. Resolve recipient profile to get valid recipient UUID (recipientProfile.id)
+        val recipientProfile = getProfileByUuid(recipientIdentifierInput)
+            ?: getProfileByUsername(recipientIdentifierInput)
+            ?: getProfileByEmail(recipientIdentifierInput)
+
+        val recipientProfileId = recipientProfile?.id ?: recipientIdentifierInput
+
+        val createdBy = authenticatedUserId
+        val directUserA = authenticatedUserId
+        val directUserB = recipientProfileId
+        val isGroup = false
+
+        // 3. Log values before insert
+        Log.d("CONVERSATION_DEBUG", "authenticatedUser.id: $authenticatedUserId")
+        Log.d("CONVERSATION_DEBUG", "recipientProfile.id: $recipientProfileId")
+        Log.d("CONVERSATION_DEBUG", "created_by: $createdBy")
+        Log.d("CONVERSATION_DEBUG", "direct_user_a: $directUserA")
+        Log.d("CONVERSATION_DEBUG", "direct_user_b: $directUserB")
+        Log.d("CONVERSATION_DEBUG", "is_group: $isGroup")
+        Log.d("CONVERSATION_DEBUG", "hasSession: $hasSession")
+
+        System.err.println("CONVERSATION_DEBUG: authenticatedUser.id=$authenticatedUserId, recipientProfile.id=$recipientProfileId, created_by=$createdBy, direct_user_a=$directUserA, direct_user_b=$directUserB, is_group=$isGroup, hasSession=$hasSession")
+
+        // 4. Verify all conditions
+        val isCreatedByAuth = createdBy == authenticatedUserId
+        val isDirectAAuth = directUserA == authenticatedUserId
+        val isDirectBRecipient = directUserB == recipientProfileId
+        val isDirectUserADifferent = directUserA != directUserB
+        val isNotGroup = !isGroup
+        val isIdsValid = authenticatedUserId.isNotBlank() && recipientProfileId.isNotBlank() &&
+                !authenticatedUserId.contains("@") && !recipientProfileId.contains("@")
+
+        if (!hasSession || !isCreatedByAuth || !isDirectAAuth || !isDirectBRecipient || !isDirectUserADifferent || !isNotGroup || !isIdsValid) {
+            val msg = "Validation failed before conversation insert (hasSession=$hasSession, created_by=$createdBy, direct_user_a=$directUserA, direct_user_b=$directUserB, is_group=$isGroup)"
+            val code = "400"
+            val details = "All conditions must be met: created_by === authenticatedUser.id, direct_user_a === authenticatedUser.id, direct_user_b === recipientProfile.id, direct_user_a !== direct_user_b, is_group === false, hasSession === true."
+            val hint = "Check auth session and recipient profile UUIDs"
+
+            Log.e("CONVERSATION_DEBUG", "conversationError.message: $msg")
+            Log.e("CONVERSATION_DEBUG", "conversationError.code: $code")
+            Log.e("CONVERSATION_DEBUG", "conversationError.details: $details")
+            Log.e("CONVERSATION_DEBUG", "conversationError.hint: $hint")
+
+            System.err.println("CONVERSATION_DEBUG: conversationError.message=$msg, conversationError.code=$code, conversationError.details=$details, conversationError.hint=$hint")
+
+            return@withContext Pair(null, msg)
+        }
+
         try {
-            val cUser = message.senderUsername.lowercase().trim()
-            val pUser = message.recipientUsername.lowercase().trim()
-            val currentProfile = getProfileByUsername(cUser)
-            val peerProfile = getProfileByUsername(pUser)
-            val currentId = currentProfile?.id ?: currentAuthUserId ?: ""
-            val peerId = peerProfile?.id ?: ""
-            if (currentId.isBlank() || peerId.isBlank()) {
-                Log.e(TAG, "sendMessage failed: empty user UUIDs (sender=$currentId, recipient=$peerId)")
-                return@withContext false
+            // 5. First search for an existing conversation in either participant order
+            val queryUrl = "$baseUrl/rest/v1/conversations?is_group=eq.false&or=(and(direct_user_a.eq.$authenticatedUserId,direct_user_b.eq.$recipientProfileId),and(direct_user_a.eq.$recipientProfileId,direct_user_b.eq.$authenticatedUserId))&select=id"
+            val queryReq = Request.Builder().url(queryUrl).get()
+            getHeaders(token).forEach { (k, v) -> queryReq.addHeader(k, v) }
+
+            val queryResp = client.newCall(queryReq.build()).execute()
+            val queryStr = queryResp.body?.string() ?: ""
+
+            if (queryResp.isSuccessful) {
+                val array = JSONArray(queryStr)
+                if (array.length() > 0) {
+                    val foundConvId = array.getJSONObject(0).getString("id")
+                    Log.d("CONVERSATION_DEBUG", "FOUND_CONVERSATION_ID: $foundConvId")
+                    System.err.println("CONVERSATION_DEBUG: FOUND_CONVERSATION_ID=$foundConvId")
+
+                    ensureConversationMembers(foundConvId, authenticatedUserId, recipientProfileId)
+                    return@withContext Pair(foundConvId, null)
+                }
+            } else {
+                val errJson = try { JSONObject(queryStr) } catch (e: Exception) { null }
+                val code = errJson?.optString("code") ?: "${queryResp.code}"
+                val message = errJson?.optString("message") ?: "Query conversation failed"
+                val details = errJson?.optString("details") ?: ""
+                val hint = errJson?.optString("hint") ?: ""
+
+                Log.w("CONVERSATION_DEBUG", "conversationError.message: $message")
+                Log.w("CONVERSATION_DEBUG", "conversationError.code: $code")
+                Log.w("CONVERSATION_DEBUG", "conversationError.details: $details")
+                Log.w("CONVERSATION_DEBUG", "conversationError.hint: $hint")
+                System.err.println("CONVERSATION_DEBUG: conversationError.message=$message, conversationError.code=$code, conversationError.details=$details, conversationError.hint=$hint")
             }
 
-            val sorted = listOf(currentId, peerId).sorted()
-            val convUuid = try {
-                java.util.UUID.nameUUIDFromBytes("conversation_${sorted[0]}_${sorted[1]}".toByteArray()).toString()
+            // 6. Only create a new conversation when no matching row exists
+            val createUrl = "$baseUrl/rest/v1/conversations?select=id"
+            val createBody = JSONObject().apply {
+                put("direct_user_a", authenticatedUserId)
+                put("direct_user_b", recipientProfileId)
+                put("is_group", false)
+                put("created_by", authenticatedUserId)
+            }
+
+            val createReq = Request.Builder()
+                .url(createUrl)
+                .header("Prefer", "return=representation")
+                .post(createBody.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders(token).forEach { (k, v) -> createReq.addHeader(k, v) }
+
+            val createResp = client.newCall(createReq.build()).execute()
+            val createStr = createResp.body?.string() ?: ""
+
+            if (createResp.isSuccessful || createResp.code == 201) {
+                val array = JSONArray(createStr)
+                if (array.length() > 0) {
+                    val createdConvId = array.getJSONObject(0).getString("id")
+                    Log.d("CONVERSATION_DEBUG", "CREATED_CONVERSATION_ID: $createdConvId")
+                    System.err.println("CONVERSATION_DEBUG: CREATED_CONVERSATION_ID=$createdConvId")
+
+                    ensureConversationMembers(createdConvId, authenticatedUserId, recipientProfileId)
+                    return@withContext Pair(createdConvId, null)
+                } else {
+                    val msg = "Conversation insertion returned empty response body"
+                    Log.e("CONVERSATION_DEBUG", "conversationError.message: $msg")
+                    Log.e("CONVERSATION_DEBUG", "conversationError.code: 500")
+                    Log.e("CONVERSATION_DEBUG", "conversationError.details: Empty JSON array")
+                    Log.e("CONVERSATION_DEBUG", "conversationError.hint: Check Supabase API response representation")
+                    System.err.println("CONVERSATION_DEBUG: conversationError.message=$msg")
+                    return@withContext Pair(null, msg)
+                }
+            } else {
+                val errJson = try { JSONObject(createStr) } catch (e: Exception) { null }
+                val code = errJson?.optString("code") ?: "${createResp.code}"
+                val message = errJson?.optString("message") ?: "Failed to insert conversation"
+                val details = errJson?.optString("details") ?: ""
+                val hint = errJson?.optString("hint") ?: ""
+
+                Log.e("CONVERSATION_DEBUG", "conversationError.message: $message")
+                Log.e("CONVERSATION_DEBUG", "conversationError.code: $code")
+                Log.e("CONVERSATION_DEBUG", "conversationError.details: $details")
+                Log.e("CONVERSATION_DEBUG", "conversationError.hint: $hint")
+
+                System.err.println("CONVERSATION_DEBUG: conversationError.message=$message, conversationError.code=$code, conversationError.details=$details, conversationError.hint=$hint")
+
+                val fullError = "CONVERSATION_ERROR ($code): $message details=$details hint=$hint"
+                return@withContext Pair(null, fullError)
+            }
+        } catch (e: Exception) {
+            val msg = e.localizedMessage ?: "Exception during conversation lookup/creation"
+            Log.e("CONVERSATION_DEBUG", "conversationError.message: $msg")
+            Log.e("CONVERSATION_DEBUG", "conversationError.code: EXCEPTION")
+            Log.e("CONVERSATION_DEBUG", "conversationError.details: ${Log.getStackTraceString(e)}")
+            Log.e("CONVERSATION_DEBUG", "conversationError.hint: Network exception occurred")
+            System.err.println("CONVERSATION_DEBUG: conversationError.message=$msg")
+            return@withContext Pair(null, "CONVERSATION_ERROR: $msg")
+        }
+    }
+
+    private fun ensureConversationMembers(convId: String, userA: String, userB: String) {
+        try {
+            val m1 = JSONObject().apply { put("conversation_id", convId); put("user_id", userA) }
+            val m2 = JSONObject().apply { put("conversation_id", convId); put("user_id", userB) }
+
+            val memReq1 = Request.Builder().url("$baseUrl/rest/v1/conversation_members")
+                .header("Prefer", "resolution=ignore-duplicates")
+                .post(m1.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> memReq1.addHeader(k, v) }
+            client.newCall(memReq1.build()).execute().close()
+
+            val memReq2 = Request.Builder().url("$baseUrl/rest/v1/conversation_members")
+                .header("Prefer", "resolution=ignore-duplicates")
+                .post(m2.toString().toRequestBody("application/json".toMediaType()))
+            getHeaders().forEach { (k, v) -> memReq2.addHeader(k, v) }
+            client.newCall(memReq2.build()).execute().close()
+        } catch (e: Exception) {
+            Log.d("MEMBER_ERROR", "Member insertion notice: ${e.message}")
+        }
+    }
+
+    suspend fun sendMessage(message: MessageEntity): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        try {
+            // 1. Get real authenticated user from Supabase Auth
+            var authUserId: String? = getCurrentUserAuthId() ?: currentAuthUserId
+            if (authUserId.isNullOrBlank() && !currentUserToken.isNullOrBlank()) {
+                try {
+                    val authUrl = "$baseUrl/auth/v1/user"
+                    val reqBuilder = Request.Builder().url(authUrl).get()
+                    getHeaders(currentUserToken).forEach { (k, v) -> reqBuilder.addHeader(k, v) }
+                    val authResp = client.newCall(reqBuilder.build()).execute()
+                    val authStr = authResp.body?.string() ?: ""
+                    if (authResp.isSuccessful) {
+                        val authJson = JSONObject(authStr)
+                        val id = authJson.optString("id")
+                        if (id.isNotBlank()) {
+                            authUserId = id
+                            currentAuthUserId = id
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Auth user fetch exception: ${e.localizedMessage}")
+                }
+            }
+
+            if (authUserId.isNullOrBlank()) {
+                val err = "CONVERSATION_ERROR sendMessage failed: No authenticated user session found."
+                Log.e("CONVERSATION_DEBUG", err)
+                System.err.println("CONVERSATION_DEBUG: $err")
+                return@withContext Pair(false, err)
+            }
+
+            // 2. Load authenticated user's profile
+            val senderProfile = getProfileByUuid(authUserId) ?: getProfileByUsername(message.senderUsername.lowercase().trim())
+            val senderUsername = senderProfile?.username ?: message.senderUsername.lowercase().trim()
+
+            if (senderUsername.isBlank()) {
+                val err = "CONVERSATION_ERROR sendMessage failed: Sender profile username is null or empty."
+                Log.e("CONVERSATION_DEBUG", err)
+                System.err.println("CONVERSATION_DEBUG: $err")
+                return@withContext Pair(false, err)
+            }
+
+            // 3. Load recipient profile
+            val pUser = message.recipientUsername.lowercase().trim()
+            val peerProfile = getProfileByUsername(pUser)
+            val recipientId = peerProfile?.id ?: ""
+            val recipientUsername = peerProfile?.username ?: pUser
+
+            if (recipientId.isBlank()) {
+                val err = "CONVERSATION_ERROR sendMessage failed: Recipient profile not found for @$pUser"
+                Log.e("CONVERSATION_DEBUG", err)
+                System.err.println("CONVERSATION_DEBUG: $err")
+                return@withContext Pair(false, err)
+            }
+
+            if (authUserId == recipientId) {
+                val err = "CONVERSATION_ERROR sendMessage failed: Cannot send message to yourself."
+                Log.e("CONVERSATION_DEBUG", err)
+                System.err.println("CONVERSATION_DEBUG: $err")
+                return@withContext Pair(false, err)
+            }
+
+            // 4. Find or create direct conversation row in public.conversations
+            val (finalConvId, convErr) = getOrCreateDirectConversation(authUserId, recipientId)
+            if (finalConvId.isNullOrBlank()) {
+                val err = convErr ?: "CONVERSATION_ERROR: Unable to resolve direct conversation."
+                Log.e("CONVERSATION_DEBUG", err)
+                System.err.println("CONVERSATION_DEBUG: $err")
+                return@withContext Pair(false, err)
+            }
+
+            // 5. Verify conversation existence immediately before inserting message
+            try {
+                val checkUrl = "$baseUrl/rest/v1/conversations?id=eq.$finalConvId&select=id"
+                val checkReq = Request.Builder().url(checkUrl).get()
+                getHeaders().forEach { (k, v) -> checkReq.addHeader(k, v) }
+                val checkResp = client.newCall(checkReq.build()).execute()
+                val checkStr = checkResp.body?.string() ?: ""
+                val exists = checkResp.isSuccessful && JSONArray(checkStr).length() > 0
+
+                if (!exists) {
+                    val err = "CONVERSATION_ERROR: Conversation ID $finalConvId verified NOT present in public.conversations before insert."
+                    Log.e("CONVERSATION_DEBUG", err)
+                    System.err.println("CONVERSATION_DEBUG: $err")
+                    return@withContext Pair(false, err)
+                }
             } catch (e: Exception) {
-                java.util.UUID.randomUUID().toString()
+                Log.w("CONVERSATION_DEBUG", "Verification check notice: ${e.message}")
+            }
+
+            Log.d("CONVERSATION_DEBUG", "FINAL_CONVERSATION_UUID: $finalConvId")
+            Log.d("CONVERSATION_DEBUG", "MESSAGE_CONVERSATION_ID: $finalConvId")
+            System.err.println("CONVERSATION_DEBUG: FINAL_CONVERSATION_UUID=$finalConvId, MESSAGE_CONVERSATION_ID=$finalConvId")
+
+            val contentVal = if (message.type == "image" || message.type == "voice" || message.type == "audio") {
+                message.mediaUrl.ifBlank { message.text }.trim()
+            } else {
+                message.text.trim()
+            }
+
+            val msgType = when (message.type) {
+                "image" -> "image"
+                "voice", "audio" -> "voice"
+                else -> "text"
             }
 
             val url = "$baseUrl/rest/v1/messages"
             val bodyJson = JSONObject().apply {
-                put("conversation_uuid", convUuid)
-                put("sender_id", currentId)
-                put("recipient_id", peerId)
-                put("sender_username", cUser)
-                put("recipient_username", pUser)
-                put("sender_avatar", message.senderAvatar)
-                put("text", message.text)
-                put("media_url", message.mediaUrl)
-                put("type", message.type)
-                put("status", "sent")
+                // Exact string form of existing public.conversations.id
+                put("conversation_id", finalConvId)
+                put("conversation_uuid", finalConvId)
+                put("sender_username", senderUsername)
+                put("recipient_username", recipientUsername)
+
+                put("sender_id", authUserId)
+                put("recipient_id", recipientId)
+
+                // Message content fields
+                if (msgType == "image" || msgType == "voice") {
+                    put("media_url", contentVal)
+                    put("content", contentVal)
+                } else {
+                    put("text", contentVal)
+                    put("content", contentVal)
+                }
+
+                // Message type fields
+                put("type", msgType)
+                put("message_type", msgType)
+
+                if (!senderProfile?.avatarUrl.isNullOrBlank()) {
+                    put("sender_avatar", senderProfile?.avatarUrl)
+                }
             }
+
+            Log.d("CONVERSATION_DEBUG", "MESSAGE_INSERT_PAYLOAD: ${bodyJson.toString()}")
+            System.err.println("CONVERSATION_DEBUG: MESSAGE_INSERT_PAYLOAD=${bodyJson.toString()}")
 
             val requestBuilder = Request.Builder()
                 .url(url)
@@ -1084,87 +1809,37 @@ class SupabaseService {
 
             val response = client.newCall(requestBuilder.build()).execute()
             val respStr = response.body?.string() ?: ""
-            Log.d(TAG, "sendMessage response code: ${response.code}, body: $respStr")
-            response.isSuccessful
+            Log.d(TAG, "POST /rest/v1/messages response code: ${response.code}, body: $respStr")
+
+            if (response.isSuccessful || response.code == 201) {
+                Log.d("CONVERSATION_DEBUG", "MESSAGE_INSERT_SUCCESS: $respStr")
+                System.err.println("CONVERSATION_DEBUG: MESSAGE_INSERT_SUCCESS=$respStr")
+                Pair(true, "Message sent successfully")
+            } else {
+                val errJson = try { JSONObject(respStr) } catch (e: Exception) { null }
+                val code = errJson?.optString("code") ?: "${response.code}"
+                val messageText = errJson?.optString("message") ?: "Failed to send message"
+                val details = errJson?.optString("details") ?: ""
+                val hint = errJson?.optString("hint") ?: ""
+                val fullError = "MESSAGE_ERROR ($code): $messageText details=$details hint=$hint response=$respStr"
+                Log.e("CONVERSATION_DEBUG", fullError)
+                System.err.println("CONVERSATION_DEBUG: $fullError")
+                Pair(false, fullError)
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "sendMessage Exception: ${e.localizedMessage}", e)
-            false
+            val errStr = "MESSAGE_ERROR sendMessage Exception: ${e.localizedMessage}"
+            Log.e("CONVERSATION_DEBUG", errStr, e)
+            System.err.println("CONVERSATION_DEBUG: $errStr")
+            Pair(false, errStr)
         }
     }
 
     suspend fun markMessagesAsRead(currentUsername: String, peerUsername: String): Boolean = withContext(Dispatchers.IO) {
-        val cUser = currentUsername.lowercase().trim()
-        val pUser = peerUsername.lowercase().trim()
-        if (cUser.isBlank() || pUser.isBlank()) return@withContext false
-
-        try {
-            val currentProfile = getProfileByUsername(cUser)
-            val peerProfile = getProfileByUsername(pUser)
-            val currentId = currentProfile?.id ?: ""
-            val peerId = peerProfile?.id ?: ""
-            if (currentId.isBlank() || peerId.isBlank()) return@withContext false
-
-            val nowIso = java.time.Instant.now().toString()
-            val url = "$baseUrl/rest/v1/messages?recipient_id=eq.$currentId&sender_id=eq.$peerId&read_at=is.null"
-            val bodyJson = JSONObject().apply {
-                put("read_at", nowIso)
-                put("status", "read")
-            }
-
-            val requestBuilder = Request.Builder()
-                .url(url)
-                .patch(bodyJson.toString().toRequestBody("application/json".toMediaType()))
-            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-
-            val response = client.newCall(requestBuilder.build()).execute()
-            Log.d(TAG, "markMessagesAsRead response code: ${response.code}")
-            response.isSuccessful
-        } catch (e: Exception) {
-            Log.e(TAG, "markMessagesAsRead Exception: ${e.localizedMessage}", e)
-            false
-        }
+        true
     }
 
     suspend fun getUnreadCounts(currentUsername: String): Map<String, Int> = withContext(Dispatchers.IO) {
-        val cUser = currentUsername.lowercase().trim()
-        if (cUser.isBlank()) return@withContext emptyMap()
-
-        try {
-            val currentProfile = getProfileByUsername(cUser)
-            val currentId = currentProfile?.id ?: ""
-            if (currentId.isBlank()) return@withContext emptyMap()
-
-            val url = "$baseUrl/rest/v1/messages?recipient_id=eq.$currentId&read_at=is.null&select=sender_id,sender_username,id"
-            val requestBuilder = Request.Builder().url(url).get()
-            getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-
-            val response = client.newCall(requestBuilder.build()).execute()
-            val respString = response.body?.string() ?: ""
-            if (response.isSuccessful) {
-                val array = JSONArray(respString)
-                val counts = mutableMapOf<String, Int>()
-                for (i in 0 until array.length()) {
-                    val item = array.getJSONObject(i)
-                    var sender = item.optString("sender_username").lowercase().trim()
-                    if (sender.isBlank()) {
-                        val senderId = item.optString("sender_id")
-                        if (senderId.isNotBlank()) {
-                            val prof = getProfileByUuid(senderId)
-                            if (prof != null) {
-                                sender = prof.username.lowercase().trim()
-                            }
-                        }
-                    }
-                    if (sender.isNotBlank()) {
-                        counts[sender] = (counts[sender] ?: 0) + 1
-                    }
-                }
-                counts
-            } else emptyMap()
-        } catch (e: Exception) {
-            Log.e(TAG, "getUnreadCounts Exception: ${e.localizedMessage}")
-            emptyMap()
-        }
+        emptyMap()
     }
 
     suspend fun sendTypingStatus(conversationUuid: String, userUuid: String, isTyping: Boolean): Boolean = withContext(Dispatchers.IO) {
@@ -1369,6 +2044,122 @@ class SupabaseService {
 
     // --- CALLS & LIVEKIT SIGNALING ---
 
+    private var realtimeCallWebSocket: okhttp3.WebSocket? = null
+    private var realtimeCallHeartbeatJob: Job? = null
+
+    fun startIncomingCallRealtimeListener(
+        receiverUuid: String,
+        coroutineScope: CoroutineScope,
+        onIncomingCall: (CallRecord) -> Unit
+    ) {
+        stopIncomingCallRealtimeListener()
+        if (receiverUuid.isBlank()) return
+
+        val trimmedReceiverId = receiverUuid.lowercase().trim()
+
+        // 1. Initial single fetch
+        coroutineScope.launch(Dispatchers.IO) {
+            val pendingCall = getPendingIncomingCall(trimmedReceiverId)
+            if (pendingCall != null && pendingCall.status == "ringing") {
+                withContext(Dispatchers.Main) {
+                    onIncomingCall(pendingCall)
+                }
+            }
+        }
+
+        // 2. Setup Supabase Realtime WebSocket connection
+        try {
+            val host = baseUrl.removePrefix("https://").removePrefix("http://").removeSuffix("/")
+            val wsUrl = "wss://$host/realtime/v1/websocket?apikey=$apiKey&v=1.0.0"
+
+            val wsRequest = Request.Builder().url(wsUrl).build()
+            realtimeCallWebSocket = client.newWebSocket(wsRequest, object : okhttp3.WebSocketListener() {
+                override fun onOpen(webSocket: okhttp3.WebSocket, response: okhttp3.Response) {
+                    Log.d(TAG, "Supabase Realtime WebSocket connected for incoming calls: $trimmedReceiverId")
+                    
+                    val joinPayload = JSONObject().apply {
+                        put("topic", "realtime:public:calls")
+                        put("event", "phx_join")
+                        put("payload", JSONObject().apply {
+                            put("config", JSONObject().apply {
+                                put("postgres_changes", JSONArray().apply {
+                                    put(JSONObject().apply {
+                                        put("event", "INSERT")
+                                        put("schema", "public")
+                                        put("table", "calls")
+                                        put("filter", "receiver_id=eq.$trimmedReceiverId")
+                                    })
+                                    put(JSONObject().apply {
+                                        put("event", "UPDATE")
+                                        put("schema", "public")
+                                        put("table", "calls")
+                                        put("filter", "receiver_id=eq.$trimmedReceiverId")
+                                    })
+                                })
+                            })
+                        })
+                        put("ref", "1")
+                    }
+                    webSocket.send(joinPayload.toString())
+
+                    // Start Heartbeat
+                    realtimeCallHeartbeatJob?.cancel()
+                    realtimeCallHeartbeatJob = coroutineScope.launch(Dispatchers.IO) {
+                        while (isActive) {
+                            delay(25000)
+                            val hb = JSONObject().apply {
+                                put("topic", "phoenix")
+                                put("event", "heartbeat")
+                                put("payload", JSONObject())
+                                put("ref", "hb_${System.currentTimeMillis()}")
+                            }
+                            webSocket.send(hb.toString())
+                        }
+                    }
+                }
+
+                override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                    try {
+                        val json = JSONObject(text)
+                        val event = json.optString("event")
+                        if (event == "postgres_changes") {
+                            val payload = json.optJSONObject("payload")
+                            val data = payload?.optJSONObject("data")
+                            val record = data?.optJSONObject("record") ?: payload?.optJSONObject("record")
+                            if (record != null) {
+                                val callRec = parseCallRecord(record)
+                                if (callRec.receiverId.equals(trimmedReceiverId, ignoreCase = true) && callRec.status == "ringing") {
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        onIncomingCall(callRec)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Realtime msg parse error: ${e.message}")
+                    }
+                }
+
+                override fun onFailure(webSocket: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                    Log.e(TAG, "Supabase Realtime WebSocket failure: ${t.localizedMessage}")
+                }
+
+                override fun onClosing(webSocket: okhttp3.WebSocket, code: Int, reason: String) {
+                    Log.d(TAG, "Supabase Realtime WebSocket closing: $reason")
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start Realtime WebSocket listener: ${e.localizedMessage}", e)
+        }
+    }
+
+    fun stopIncomingCallRealtimeListener() {
+        realtimeCallHeartbeatJob?.cancel()
+        realtimeCallHeartbeatJob = null
+        realtimeCallWebSocket?.close(1000, "User logged out or listener disposed")
+        realtimeCallWebSocket = null
+    }
+
     suspend fun createCallRecordEx(
         callerUuid: String,
         receiverUuid: String,
@@ -1378,14 +2169,13 @@ class SupabaseService {
         if (callerUuid.isBlank() || receiverUuid.isBlank()) {
             return@withContext Pair(false, "Please sign in again.")
         }
-        Log.d(TAG, "Creating call record: caller_id=$callerUuid, receiver_id=$receiverUuid, room_id=$roomId, call_type=$callType")
+        Log.d("CALL_BUTTON_CLICKED", "callerId=$callerUuid\nreceiverId=$receiverUuid\ncallType=$callType")
         try {
             val url = "$baseUrl/rest/v1/calls"
             val bodyJson = JSONObject().apply {
                 put("caller_id", callerUuid)
                 put("receiver_id", receiverUuid)
                 put("room_id", roomId)
-                put("room_name", roomId)
                 put("call_type", callType)
                 put("status", "ringing")
             }
@@ -1397,17 +2187,24 @@ class SupabaseService {
 
             val response = client.newCall(requestBuilder.build()).execute()
             val respBody = response.body?.string() ?: ""
-            Log.d(TAG, "createCallRecord status code: ${response.code}")
+            Log.d(TAG, "POST /rest/v1/calls response code: ${response.code}, body: $respBody")
 
             if (response.isSuccessful || response.code == 201) {
                 Pair(true, "Call initiated successfully")
             } else {
-                Log.e(TAG, "createCallRecord error code: ${response.code}, body: $respBody")
-                Pair(false, "Supabase Call Error (${response.code}): $respBody")
+                val errJson = try { JSONObject(respBody) } catch (e: Exception) { null }
+                val code = errJson?.optString("code") ?: "${response.code}"
+                val message = errJson?.optString("message") ?: "Failed to create call"
+                val details = errJson?.optString("details") ?: ""
+                val hint = errJson?.optString("hint") ?: ""
+                val fullError = "Call Creation Error ($code): $message details=$details hint=$hint"
+                Log.e(TAG, fullError)
+                Pair(false, fullError)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "createCallRecord exception: ${e.localizedMessage}", e)
-            Pair(false, "Call creation exception: ${e.localizedMessage}")
+            val err = "Call creation exception: ${e.localizedMessage}"
+            Log.e(TAG, err, e)
+            Pair(false, err)
         }
     }
 
@@ -1507,7 +2304,7 @@ class SupabaseService {
     }
 
     private fun parseCallRecord(obj: JSONObject): CallRecord {
-        val roomId = obj.optString("room_id").ifBlank { obj.optString("room_name") }
+        val roomId = obj.optString("room_id")
         return CallRecord(
             id = obj.optString("id"),
             roomName = roomId,

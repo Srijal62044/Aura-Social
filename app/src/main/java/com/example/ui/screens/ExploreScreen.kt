@@ -36,6 +36,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,21 +62,27 @@ fun ExploreScreen(
     searchHistory: List<SearchHistoryEntity>,
     allUsers: List<UserEntity>,
     allPosts: List<PostEntity>,
+    currentUser: UserEntity?,
     onQueryChange: (String) -> Unit,
     onSearchSubmit: (String) -> Unit,
     onClearHistory: () -> Unit,
     onUserClick: (String) -> Unit,
-    onPostClick: (PostEntity) -> Unit
+    onPostClick: (PostEntity) -> Unit,
+    onRefreshUsers: () -> Unit
 ) {
     var selectedTab by remember { mutableStateOf("Top") }
     val tabs = listOf("Top", "People", "Hashtags", "Places")
     val hashtags = listOf("#Architecture", "#Aura", "#Tokyo", "#Tech", "#Design", "#Travel", "#Creative")
 
-    val filteredUsers = remember(searchQuery, allUsers) {
+    LaunchedEffect(Unit) {
+        onRefreshUsers()
+    }
+
+    val filteredUsers = remember(searchQuery, allUsers, currentUser) {
         if (searchQuery.isBlank()) emptyList()
         else allUsers.filter {
-            it.username.contains(searchQuery, ignoreCase = true) ||
-                    it.fullName.contains(searchQuery, ignoreCase = true)
+            val isCurrentUser = currentUser != null && it.id.isNotBlank() && it.id == currentUser.id
+            !isCurrentUser
         }
     }
 

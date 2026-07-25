@@ -21,7 +21,9 @@ data class UserEntity(
     val postCount: Int = 0,
     val followStatus: String = "none", // "none", "following", "requested"
     val isBlocked: Boolean = false,
-    val isRestricted: Boolean = false
+    val isRestricted: Boolean = false,
+    val isOnline: Boolean = false,
+    val lastSeen: String = ""
 )
 
 @Entity(tableName = "posts")
@@ -111,10 +113,6 @@ data class MessageEntity(
     val mediaUrl: String = "",
     val type: String = "text", // "text", "image", "voice", "post_share"
     val timestamp: String = "Just now",
-    val isRead: Boolean = false,
-    val readAt: String? = null,
-    val deliveredAt: String? = null,
-    val status: String = "sent", // "sending", "sent", "delivered", "read", "failed"
     val isMine: Boolean = true,
     val reaction: String = ""
 )

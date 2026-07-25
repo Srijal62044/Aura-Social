@@ -39,7 +39,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -239,8 +241,8 @@ fun AuthScreen(
                             username = it
                             localError = null
                         },
-                        label = { Text("Username or Email") },
-                        leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) },
+                        label = { Text("Email or Username") },
+                        leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 12.dp)
@@ -322,32 +324,36 @@ fun AuthScreen(
                         localError = null
                         when (authState) {
                             AuthState.LOGIN -> {
-                                if (username.isBlank() || password.isBlank()) {
-                                    localError = "Please enter both username/email and password."
-                                } else {
-                                    onLogin(username, password)
+                                val cleanIdentifier = username.trim()
+                                when {
+                                    cleanIdentifier.isBlank() -> localError = "Email or Username is required."
+                                    password.isBlank() -> localError = "Password is required."
+                                    else -> onLogin(cleanIdentifier, password)
                                 }
                             }
                             AuthState.REGISTER -> {
+                                val cleanEmail = email.trim()
+                                val cleanUsername = username.trim().lowercase()
                                 when {
                                     name.isBlank() -> localError = "Full Name is required."
-                                    username.isBlank() -> localError = "Unique Username is required."
-                                    username.length < 3 -> localError = "Username must be at least 3 characters."
-                                    !username.matches(Regex("^[a-zA-Z0-9_.]+$")) -> localError = "Username can only contain letters, numbers, underscores and dots."
-                                    email.isBlank() || !email.contains("@") -> localError = "Please enter a valid email address."
+                                    cleanUsername.isBlank() -> localError = "Unique Username is required."
+                                    cleanUsername.length < 3 -> localError = "Username must be at least 3 characters."
+                                    !cleanUsername.matches(Regex("^[a-zA-Z0-9_.]+$")) -> localError = "Username can only contain letters, numbers, underscores and dots."
+                                    cleanEmail.isBlank() || !cleanEmail.contains("@") -> localError = "Please enter a valid email address."
                                     password.isBlank() -> localError = "Password is required."
                                     password.length < 4 -> localError = "Password must be at least 4 characters long."
                                     password != confirmPassword -> localError = "Password and confirm password do not match."
-                                    else -> onRegister(name, username, email, password)
+                                    else -> onRegister(name, cleanUsername, cleanEmail, password)
                                 }
                             }
                             AuthState.FORGOT_PASSWORD -> {
+                                val cleanIdentifier = username.trim()
                                 when {
-                                    username.isBlank() -> localError = "Please enter your username or email."
+                                    cleanIdentifier.isBlank() -> localError = "Please enter your username or email."
                                     password.isBlank() -> localError = "New password is required."
                                     password.length < 4 -> localError = "Password must be at least 4 characters."
                                     password != confirmPassword -> localError = "Passwords do not match."
-                                    else -> onResetPassword(username, password)
+                                    else -> onResetPassword(cleanIdentifier, password)
                                 }
                             }
                             else -> {}
@@ -356,7 +362,8 @@ fun AuthScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(50.dp)
-                        .testTag("auth_action_button"),
+                        .testTag("auth_action_button")
+                        .zIndex(1f),
                     enabled = !isLoading,
                     shape = RoundedCornerShape(25.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = AuraPink)
@@ -401,6 +408,20 @@ fun AuthScreen(
                         Spacer(modifier = Modifier.weight(1f).height(1.dp).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)))
                     }
                     Spacer(modifier = Modifier.height(16.dp))
+
+                    if (authState == AuthState.LOGIN) {
+                        Text(
+                            text = "Accounts created with Google should use Continue with Google.",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 12.dp)
+                        )
+                    }
 
                     Button(
                         onClick = onGoogleSignIn,

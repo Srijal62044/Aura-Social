@@ -30,6 +30,8 @@ import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Hd
+import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
@@ -82,6 +84,7 @@ fun SettingsPrivacyScreen(
     onBackClick: () -> Unit,
     onToggleTheme: () -> Unit,
     onOpenAdminDashboard: () -> Unit,
+    onEditProfileClick: () -> Unit = {},
     onLanguageChange: (String) -> Unit = {},
     onLogout: () -> Unit,
     onShowFeedback: (String) -> Unit = {}
@@ -101,6 +104,8 @@ fun SettingsPrivacyScreen(
     var showBlockedAccountsDialog by remember { mutableStateOf(false) }
     var showPasswordSecurityDialog by remember { mutableStateOf(false) }
     var showLanguageDialog by remember { mutableStateOf(false) }
+    var showHelpDialog by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
     var showLogoutConfirmation by remember { mutableStateOf(false) }
     var showDeleteAccountConfirmation by remember { mutableStateOf(false) }
 
@@ -162,6 +167,18 @@ fun SettingsPrivacyScreen(
                 }
             }
         }
+
+        // Profile Section
+        SettingsSectionTitle("Profile")
+
+        SettingsRow(
+            icon = Icons.Default.Person,
+            title = "Edit Profile & Bio",
+            subtitle = user?.fullName ?: user?.username ?: "Manage profile details",
+            onClick = { onEditProfileClick() }
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
 
         // Preferences & Appearance Section
         SettingsSectionTitle("Preferences & Display")
@@ -328,6 +345,25 @@ fun SettingsPrivacyScreen(
                 Toast.makeText(context, "App cache cleared successfully! (18.4 MB freed)", Toast.LENGTH_SHORT).show()
                 onShowFeedback("Cache cleared successfully!")
             }
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+
+        // Support & Information Section
+        SettingsSectionTitle("Support & Information")
+
+        SettingsRow(
+            icon = Icons.Default.HelpOutline,
+            title = "Help & Support",
+            subtitle = "FAQ, contact support & guidelines",
+            onClick = { showHelpDialog = true }
+        )
+
+        SettingsRow(
+            icon = Icons.Default.Info,
+            title = "About Aura",
+            subtitle = "Version 2.5.0 • Terms & Privacy",
+            onClick = { showAboutDialog = true }
         )
 
         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
@@ -524,6 +560,46 @@ fun SettingsPrivacyScreen(
             dismissButton = {
                 TextButton(onClick = { showLogoutConfirmation = false }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Help Dialog
+    if (showHelpDialog) {
+        AlertDialog(
+            onDismissRequest = { showHelpDialog = false },
+            title = { Text("Help & Support Center", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("• How to reset password? Go to login screen and click 'Forgot Password'.", fontSize = 13.sp)
+                    Text("• How to go private? Enable 'Private Account' in Privacy settings.", fontSize = 13.sp)
+                    Text("• Contact Support: support@aurasocial.app", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = AuraPink)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showHelpDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    // About Dialog
+    if (showAboutDialog) {
+        AlertDialog(
+            onDismissRequest = { showAboutDialog = false },
+            title = { Text("About Aura", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Aura Social v2.5.0 (Production Release)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("The ultimate modern social experience with Material 3, real-time messaging, reels, stories, and audio/video calls.", fontSize = 13.sp)
+                    Text("© 2026 Aura Technologies Inc. All rights reserved.", fontSize = 12.sp, color = Color.Gray)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAboutDialog = false }) {
+                    Text("Close")
                 }
             }
         )

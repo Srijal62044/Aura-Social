@@ -8,12 +8,15 @@ import androidx.activity.viewModels
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -53,6 +56,16 @@ import com.example.ui.theme.AuraTheme
 
 class MainActivity : ComponentActivity() {
     private val viewModel: AuraViewModel by viewModels()
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.updateOnlineStatus(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        viewModel.updateOnlineStatus(false)
+    }
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
@@ -137,6 +150,12 @@ class MainActivity : ComponentActivity() {
             val currentUserPosts by viewModel.currentUserPosts.collectAsStateWithLifecycle()
             val currentUserReels by viewModel.currentUserReels.collectAsStateWithLifecycle()
 
+            val isFollowLoading by viewModel.isFollowLoading.collectAsStateWithLifecycle()
+            val followersList by viewModel.followersList.collectAsStateWithLifecycle()
+            val followingList by viewModel.followingList.collectAsStateWithLifecycle()
+            val isLoadingFollowList by viewModel.isLoadingFollowList.collectAsStateWithLifecycle()
+            val activeFollowListType by viewModel.activeFollowListType.collectAsStateWithLifecycle()
+
             val activePostForComments by viewModel.activePostForComments.collectAsStateWithLifecycle()
             val commentsForActivePost by viewModel.commentsForActivePost.collectAsStateWithLifecycle()
 
@@ -150,6 +169,7 @@ class MainActivity : ComponentActivity() {
 
             val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
             val searchHistory by viewModel.searchHistory.collectAsStateWithLifecycle()
+            val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
 
             val snackbarHostState = remember { SnackbarHostState() }
             val sheetState = rememberModalBottomSheetState()
@@ -193,6 +213,7 @@ class MainActivity : ComponentActivity() {
 
                     Scaffold(
                         modifier = Modifier.fillMaxSize(),
+                        contentWindowInsets = if (showTopAndBottomBars) ScaffoldDefaults.contentWindowInsets else WindowInsets(0, 0, 0, 0),
                         topBar = {
                             if (showTopAndBottomBars && currentScreen != AuraScreen.REELS) {
                                 AuraTopBar(
@@ -220,7 +241,7 @@ class MainActivity : ComponentActivity() {
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(innerPadding)
+                                .padding(if (showTopAndBottomBars) innerPadding else PaddingValues(0.dp))
                         ) {
                             Crossfade(targetState = currentScreen, label = "ScreenTransition") { screen ->
                                 when (screen) {
@@ -244,13 +265,15 @@ class MainActivity : ComponentActivity() {
                                     AuraScreen.EXPLORE -> ExploreScreen(
                                         searchQuery = searchQuery,
                                         searchHistory = searchHistory,
-                                        allUsers = allUsers,
+                                        allUsers = searchResults,
                                         allPosts = allPosts,
+                                        currentUser = currentUser,
                                         onQueryChange = { viewModel.updateSearchQuery(it) },
                                         onSearchSubmit = { viewModel.performSearch(it) },
                                         onClearHistory = { viewModel.clearSearchHistory() },
                                         onUserClick = { username -> viewModel.selectUserProfile(username) },
-                                        onPostClick = { post -> viewModel.openCommentsForPost(post) }
+                                        onPostClick = { post -> viewModel.openCommentsForPost(post) },
+                                        onRefreshUsers = { viewModel.refreshSearchUsers() }
                                     )
 
                                     AuraScreen.CREATE -> CreateScreen(
@@ -276,6 +299,15 @@ class MainActivity : ComponentActivity() {
                                     AuraScreen.PROFILE -> ProfileScreen(
                                         user = currentUser,
                                         isSelf = true,
+                                        isFollowLoading = isFollowLoading,
+                                        followersList = followersList,
+                                        followingList = followingList,
+                                        isLoadingFollowList = isLoadingFollowList,
+                                        activeListType = activeFollowListType,
+                                        onFollowersClick = { currentUser?.let { u -> viewModel.openFollowersList(u.id) } },
+                                        onFollowingClick = { currentUser?.let { u -> viewModel.openFollowingList(u.id) } },
+                                        onCloseFollowList = { viewModel.closeFollowList() },
+                                        onUserClick = { u -> viewModel.selectUserProfile(u.username) },
                                         posts = currentUserPosts,
                                         reels = currentUserReels,
                                         savedPosts = savedPosts,
@@ -292,6 +324,15 @@ class MainActivity : ComponentActivity() {
                                     AuraScreen.USER_PROFILE -> ProfileScreen(
                                         user = selectedUserProfile,
                                         isSelf = false,
+                                        isFollowLoading = isFollowLoading,
+                                        followersList = followersList,
+                                        followingList = followingList,
+                                        isLoadingFollowList = isLoadingFollowList,
+                                        activeListType = activeFollowListType,
+                                        onFollowersClick = { selectedUserProfile?.let { u -> viewModel.openFollowersList(u.id) } },
+                                        onFollowingClick = { selectedUserProfile?.let { u -> viewModel.openFollowingList(u.id) } },
+                                        onCloseFollowList = { viewModel.closeFollowList() },
+                                        onUserClick = { u -> viewModel.selectUserProfile(u.username) },
                                         posts = selectedUserPosts,
                                         reels = emptyList(),
                                         savedPosts = emptyList(),
@@ -337,28 +378,36 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     AuraScreen.DIRECT_MESSAGES -> DirectMessagesScreen(
-                                        users = allUsers.filter { it.username != currentUsername },
+                                        users = allUsers.filter { it.followStatus == "following" && it.username != currentUsername },
                                         unreadCounts = unreadCountsPerConversation,
                                         onBackClick = { viewModel.navigateTo(AuraScreen.HOME) },
                                         onOpenChat = { username -> viewModel.openChat(username) }
                                     )
 
-                                    AuraScreen.CHAT_DETAIL -> ChatDetailScreen(
-                                        conversationId = selectedConversationId ?: "Chat",
-                                        messages = activeMessages,
-                                        isPeerTyping = isPeerTyping,
-                                        typingPeerUsername = typingPeerUsername,
-                                        onBackClick = {
-                                            viewModel.closeChat()
-                                            viewModel.navigateTo(AuraScreen.DIRECT_MESSAGES)
-                                        },
-                                        onStartCall = { isVideo -> viewModel.startCall(isVideo) },
-                                        onSendMessage = { text, media, type ->
-                                            viewModel.sendMessage(text, media, type)
-                                        },
-                                        onTyping = { viewModel.onUserTyping() },
-                                        onDeleteMessage = { id -> viewModel.deleteMessage(id) }
-                                    )
+                                     AuraScreen.CHAT_DETAIL -> {
+                                        val peerUser = allUsers.find { it.username.equals(selectedConversationId, ignoreCase = true) }
+                                        val isConversationLoading by viewModel.isConversationLoading.collectAsStateWithLifecycle()
+                                        ChatDetailScreen(
+                                            conversationId = selectedConversationId ?: "Chat",
+                                            peerAvatarUrl = peerUser?.avatarUrl ?: "",
+                                            isOnline = peerUser?.isOnline == true,
+                                            lastSeen = peerUser?.lastSeen ?: "",
+                                            messages = activeMessages,
+                                            isPeerTyping = isPeerTyping,
+                                            typingPeerUsername = typingPeerUsername,
+                                            isConversationLoading = isConversationLoading,
+                                            onBackClick = {
+                                                viewModel.closeChat()
+                                                viewModel.navigateTo(AuraScreen.DIRECT_MESSAGES)
+                                            },
+                                            onStartCall = { isVideo -> viewModel.startCall(isVideo) },
+                                            onSendMessage = { text, media, type, onResult ->
+                                                viewModel.sendMessage(text, media, type, onResult)
+                                            },
+                                            onTyping = { viewModel.onUserTyping() },
+                                            onDeleteMessage = { id -> viewModel.deleteMessage(id) }
+                                        )
+                                    }
 
                                     AuraScreen.NOTIFICATIONS -> NotificationsScreen(
                                         notifications = notifications,

@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -85,12 +86,16 @@ import kotlinx.coroutines.launch
 @Composable
 fun ChatDetailScreen(
     conversationId: String,
+    peerAvatarUrl: String = "",
+    isOnline: Boolean = false,
+    lastSeen: String = "",
     messages: List<MessageEntity>,
     isPeerTyping: Boolean = false,
     typingPeerUsername: String? = null,
+    isConversationLoading: Boolean = false,
     onBackClick: () -> Unit,
     onStartCall: (Boolean) -> Unit, // true: video call, false: voice call
-    onSendMessage: (String, String, String) -> Unit,
+    onSendMessage: (text: String, mediaUrl: String, type: String, onResult: ((Boolean, String) -> Unit)?) -> Unit,
     onTyping: () -> Unit = {},
     onDeleteMessage: (Long) -> Unit
 ) {
@@ -109,7 +114,7 @@ fun ChatDetailScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            onSendMessage("Photo 📸", it.toString(), "image")
+            onSendMessage("Photo 📸", it.toString(), "image", null)
         }
     }
 
@@ -153,6 +158,7 @@ fun ChatDetailScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
             .imePadding()
             .testTag("chat_detail_screen")
     ) {
@@ -169,7 +175,7 @@ fun ChatDetailScreen(
                     Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                 }
                 AsyncImage(
-                    model = "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500",
+                    model = peerAvatarUrl.ifBlank { "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500" },
                     contentDescription = conversationId,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -186,7 +192,16 @@ fun ChatDetailScreen(
                         )
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (isPeerTyping) {
+                        if (isConversationLoading) {
+                            Text(
+                                text = "Connecting...",
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontSize = 11.sp,
+                                    fontStyle = FontStyle.Italic,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                )
+                            )
+                        } else if (isPeerTyping) {
                             Text(
                                 text = "typing...",
                                 style = MaterialTheme.typography.bodyMedium.copy(
@@ -201,11 +216,11 @@ fun ChatDetailScreen(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(Color(0xFF22C55E))
+                                    .background(if (isOnline) Color(0xFF22C55E) else Color.Gray)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = "Active now",
+                                text = if (isOnline) "Active now" else if (lastSeen.isNotBlank() && !lastSeen.contains("null", ignoreCase = true)) "Last seen ${lastSeen.take(16).replace("T", " ")}" else "Offline",
                                 style = MaterialTheme.typography.bodyMedium.copy(
                                     fontSize = 11.sp,
                                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
@@ -322,54 +337,6 @@ fun ChatDetailScreen(
                                             color = if (isMine) Color.White.copy(alpha = 0.7f) else Color.Gray
                                         )
                                     )
-                                    if (isMine) {
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        when {
-                                            msg.status == "sending" -> {
-                                                Icon(
-                                                    imageVector = Icons.Default.Schedule,
-                                                    contentDescription = "Sending",
-                                                    tint = Color.White.copy(alpha = 0.7f),
-                                                    modifier = Modifier.size(12.dp)
-                                                )
-                                            }
-                                            msg.status == "read" || msg.readAt != null -> {
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Icon(
-                                                        imageVector = Icons.Default.DoneAll,
-                                                        contentDescription = "Read",
-                                                        tint = Color(0xFF60A5FA), // Light blue checkmark
-                                                        modifier = Modifier.size(14.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(2.dp))
-                                                    Text(
-                                                        text = "Read",
-                                                        style = MaterialTheme.typography.labelSmall.copy(
-                                                            fontSize = 8.sp,
-                                                            fontWeight = FontWeight.Bold,
-                                                            color = Color(0xFF93C5FD)
-                                                        )
-                                                    )
-                                                }
-                                            }
-                                            msg.status == "delivered" || msg.deliveredAt != null -> {
-                                                Icon(
-                                                    imageVector = Icons.Default.DoneAll,
-                                                    contentDescription = "Delivered",
-                                                    tint = Color.White.copy(alpha = 0.9f),
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            }
-                                            else -> { // sent
-                                                Icon(
-                                                    imageVector = Icons.Default.Done,
-                                                    contentDescription = "Sent",
-                                                    tint = Color.White.copy(alpha = 0.8f),
-                                                    modifier = Modifier.size(12.dp)
-                                                )
-                                            }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -435,7 +402,7 @@ fun ChatDetailScreen(
                     }
                     IconButton(onClick = {
                         val durationStr = "0:${if (recordingSeconds < 10) "0$recordingSeconds" else recordingSeconds}"
-                        onSendMessage("🎤 Voice Note ($durationStr)", "", "voice")
+                        onSendMessage("🎤 Voice Note ($durationStr)", "", "voice", null)
                         isRecordingVoiceNote = false
                     }) {
                         Icon(Icons.Default.Check, contentDescription = "Send Recording", tint = AuraPink)
@@ -479,17 +446,26 @@ fun ChatDetailScreen(
                         IconButton(
                             onClick = {
                                 if (messageText.isNotBlank()) {
-                                    onSendMessage(messageText, "", "text")
-                                    messageText = ""
+                                    val textToSend = messageText
+                                    onSendMessage(textToSend, "", "text") { success, _ ->
+                                        if (success) {
+                                            messageText = ""
+                                        }
+                                    }
+                                    coroutineScope.launch {
+                                        if (messages.isNotEmpty()) {
+                                            listState.animateScrollToItem(messages.size - 1)
+                                        }
+                                    }
                                 }
                             },
-                            enabled = messageText.isNotBlank(),
+                            enabled = messageText.isNotBlank() && !isConversationLoading,
                             modifier = Modifier.testTag("send_message_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Send,
                                 contentDescription = "Send",
-                                tint = if (messageText.isNotBlank()) AuraPink else Color.Gray
+                                tint = if (messageText.isNotBlank() && !isConversationLoading) AuraPink else Color.Gray
                             )
                         }
                     }
@@ -517,16 +493,16 @@ fun ChatDetailScreen(
                     TextButton(
                         onClick = {
                             showPhotoOptionsDialog = false
-                            onSendMessage("Beautiful Sunset 🌅", "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800", "image")
+                            onSendMessage("Beautiful Sunset 🌅", "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800", "image", null)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("🌅 Send Sunset Photo")
+                        Text("📷 Send Sunset Photo")
                     }
                     TextButton(
                         onClick = {
                             showPhotoOptionsDialog = false
-                            onSendMessage("Cozy Coffee ☕", "https://images.unsplash.com/photo-1509042239860-f550ce710b93?w=800", "image")
+                            onSendMessage("Cozy Coffee ☕", "https://images.unsplash.com/photo-1509042239860-f550ce710b93?w=800", "image", null)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {

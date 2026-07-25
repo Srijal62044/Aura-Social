@@ -113,6 +113,20 @@ class AuraRepository(
         return result
     }
 
+    suspend fun loadProfileForAuthUser(
+        userId: String,
+        email: String,
+        token: String,
+        userMetadata: org.json.JSONObject?
+    ): Pair<UserEntity?, String> {
+        val result = supabase.loadOrCreateProfileForUser(userId, email, userMetadata, token)
+        if (result.first != null) {
+            fetchUsers()
+            fetchPosts()
+        }
+        return result
+    }
+
     suspend fun resetPassword(identifier: String, newPassword: String): Pair<Boolean, String> {
         val user = getUserByUsernameOrEmail(identifier) ?: return Pair(false, "Account not found.")
         val updated = user.copy(password = newPassword)
@@ -177,62 +191,102 @@ class AuraRepository(
         updateUser(user)
     }
 
-    fun searchUsers(query: String): Flow<List<UserEntity>> = _users.map { list ->
-        if (query.isBlank()) list else list.filter {
-            it.username.contains(query, ignoreCase = true) || it.fullName.contains(query, ignoreCase = true)
+    fun searchUsers(query: String): Flow<List<UserEntity>> {
+        val currentUserId = supabase.currentAuthUserId ?: ""
+        return _users.map { list ->
+            list.filter {
+                val isCurrentUser = currentUserId.isNotBlank() && it.id.isNotBlank() && it.id == currentUserId
+                !isCurrentUser && (
+                    if (query.isBlank()) true else (
+                        it.username.contains(query, ignoreCase = true) ||
+                        it.fullName.contains(query, ignoreCase = true)
+                    )
+                )
+            }
         }
     }
 
-    suspend fun toggleFollowUser(targetUsername: String, currentUsername: String) {
+    suspend fun searchUsersRemote(query: String): List<UserEntity> {
+        val currentUserId = supabase.currentAuthUserId ?: ""
+        return supabase.searchProfiles(query, currentUserId)
+    }
+
+    suspend fun getFollowStatus(followerId: String, followingId: String): String {
+        return supabase.getFollowStatusByUuids(followerId, followingId)
+    }
+
+    suspend fun getFollowerCount(profileId: String): Int {
+        return supabase.getFollowerCount(profileId)
+    }
+
+    suspend fun getFollowingCount(profileId: String): Int {
+        return supabase.getFollowingCount(profileId)
+    }
+
+    suspend fun getFollowersList(profileId: String): List<UserEntity> {
+        return supabase.getFollowersList(profileId)
+    }
+
+    suspend fun getFollowingList(profileId: String): List<UserEntity> {
+        return supabase.getFollowingList(profileId)
+    }
+
+    suspend fun toggleFollowUserEx(currentUserId: String, viewedProfileId: String): Pair<Boolean, String> {
+        if (currentUserId.isBlank() || viewedProfileId.isBlank() || currentUserId.equals(viewedProfileId, ignoreCase = true)) {
+            return Pair(false, "Invalid follow action: cannot follow self or empty user ID")
+        }
+        val result = supabase.toggleFollow(currentUserId, viewedProfileId)
+        fetchUsers()
+        return result
+    }
+
+    suspend fun toggleFollowUser(targetUsername: String, currentUsername: String): Pair<Boolean, String> {
         if (targetUsername.isBlank() || currentUsername.isBlank() || targetUsername.equals(currentUsername, ignoreCase = true)) {
             Log.w("AuraRepository", "toggleFollowUser ignored: self-follow or blank username")
-            return
+            return Pair(false, "Invalid action: self-follow or empty username")
         }
 
-        val targetUser = getUserDirect(targetUsername, currentUsername) ?: return
+        val targetUser = getUserDirect(targetUsername, currentUsername)
         val currentUserProfile = getUserDirect(currentUsername)
 
-        // Optimistic UI calculation
-        val oldStatus = targetUser.followStatus
-        val nextStatus = when (oldStatus) {
-            "following", "requested" -> "none"
-            else -> if (targetUser.isPrivate) "requested" else "following"
+        val currentUserId = currentUserProfile?.id ?: supabase.currentAuthUserId ?: ""
+        val targetUserId = targetUser?.id ?: ""
+
+        if (currentUserId.isBlank() || targetUserId.isBlank()) {
+            return Pair(false, "User profile IDs missing.")
         }
 
-        // Apply optimistic update
-        val updatedTargetOpt = targetUser.copy(
-            followStatus = nextStatus,
-            followerCount = if (nextStatus == "following") targetUser.followerCount + 1 else if (oldStatus == "following") (targetUser.followerCount - 1).coerceAtLeast(0) else targetUser.followerCount
-        )
-        _users.value = _users.value.map { if (it.username.equals(targetUsername, ignoreCase = true)) updatedTargetOpt else it }
+        return try {
+            val (toggleSuccess, realStatus) = supabase.toggleFollow(currentUserId, targetUserId, targetUser?.isPrivate == true)
 
-        val realStatus = supabase.toggleFollow(currentUsername, targetUsername, targetUser.isPrivate)
+            if (!toggleSuccess) {
+                return Pair(false, realStatus)
+            }
 
-        val updatedTargetFinal = targetUser.copy(
-            followStatus = realStatus,
-            followerCount = if (realStatus == "following") targetUser.followerCount + 1 else if (oldStatus == "following") (targetUser.followerCount - 1).coerceAtLeast(0) else targetUser.followerCount
-        )
-        supabase.upsertProfile(updatedTargetFinal)
+            fetchUsers(currentUsername)
 
-        if (currentUserProfile != null) {
-            val updatedCurrent = currentUserProfile.copy(
-                followingCount = if (realStatus == "following") currentUserProfile.followingCount + 1 else if (oldStatus == "following") (currentUserProfile.followingCount - 1).coerceAtLeast(0) else currentUserProfile.followingCount
-            )
-            supabase.upsertProfile(updatedCurrent)
-        }
-
-        fetchUsers(currentUsername)
-
-        if (realStatus == "following" || realStatus == "requested") {
-            supabase.addNotification(
-                NotificationEntity(
-                    recipientUsername = targetUsername,
-                    actorUsername = currentUsername,
-                    actorAvatar = currentUserProfile?.avatarUrl ?: "",
-                    type = if (realStatus == "requested") "follow_request" else "follow",
-                    text = if (realStatus == "requested") "requested to follow you" else "started following you"
+            if (realStatus == "following" || realStatus == "requested") {
+                supabase.addNotification(
+                    NotificationEntity(
+                        recipientUsername = targetUsername,
+                        actorUsername = currentUsername,
+                        actorAvatar = currentUserProfile?.avatarUrl ?: "",
+                        type = if (realStatus == "requested") "follow_request" else "follow",
+                        text = if (realStatus == "requested") "requested to follow you" else "started following you"
+                    )
                 )
-            )
+            }
+
+            val msg = when (realStatus) {
+                "following" -> "Now following @$targetUsername"
+                "requested" -> "Follow request sent to @$targetUsername"
+                else -> "Unfollowed @$targetUsername"
+            }
+            Pair(true, msg)
+        } catch (e: Exception) {
+            Log.e("AuraRepository", "toggleFollowUser exception: ${e.message}", e)
+            fetchUsers(currentUsername)
+            Pair(false, e.message ?: "Failed to update follow status")
         }
     }
 
@@ -429,14 +483,21 @@ class AuraRepository(
         _messagesMap.value = _messagesMap.value.toMutableMap().apply { put(conversationId, list) }
     }
 
-    suspend fun sendMessage(message: MessageEntity, appContext: Context? = context) {
+    suspend fun sendMessage(message: MessageEntity, appContext: Context? = context): Pair<Boolean, String> {
         var mediaUrl = message.mediaUrl
         if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
-            mediaUrl = supabase.uploadMedia(appContext, "post-media", mediaUrl)
+            val uploaded = supabase.uploadMedia(appContext, "chat-media", mediaUrl)
+            if (uploaded.isBlank()) {
+                return Pair(false, "Media upload failed. Message not sent.")
+            }
+            mediaUrl = uploaded
         }
         val cleanMsg = message.copy(mediaUrl = mediaUrl)
-        supabase.sendMessage(cleanMsg)
-        fetchMessages(message.senderUsername, message.conversationId)
+        val result = supabase.sendMessage(cleanMsg)
+        if (result.first) {
+            fetchMessages(message.senderUsername, message.conversationId)
+        }
+        return result
     }
 
     suspend fun markMessagesAsRead(currentUsername: String, peerUsername: String) {
@@ -619,5 +680,19 @@ class AuraRepository(
 
     suspend fun fetchLiveKitToken(roomName: String, identity: String): String? {
         return supabase.fetchLiveKitToken(roomName, identity)
+    }
+
+    suspend fun updateOnlineStatus(userId: String, isOnline: Boolean) {
+        if (userId.isNotBlank()) {
+            supabase.updateOnlineStatus(userId, isOnline)
+        }
+    }
+
+    fun startIncomingCallRealtimeListener(receiverUuid: String, coroutineScope: kotlinx.coroutines.CoroutineScope, onIncomingCall: (com.example.data.remote.CallRecord) -> Unit) {
+        supabase.startIncomingCallRealtimeListener(receiverUuid, coroutineScope, onIncomingCall)
+    }
+
+    fun stopIncomingCallRealtimeListener() {
+        supabase.stopIncomingCallRealtimeListener()
     }
 }

@@ -59,6 +59,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.TextButton
 import com.example.data.local.PostEntity
 import com.example.data.local.ReelEntity
 import com.example.data.local.UserEntity
@@ -73,9 +78,18 @@ fun ProfileScreen(
     posts: List<PostEntity>,
     reels: List<ReelEntity>,
     savedPosts: List<PostEntity>,
+    isFollowLoading: Boolean = false,
+    followersList: List<UserEntity>? = null,
+    followingList: List<UserEntity>? = null,
+    isLoadingFollowList: Boolean = false,
+    activeListType: String? = null,
     onEditProfileClick: () -> Unit,
     onSettingsClick: () -> Unit,
     onFollowClick: () -> Unit,
+    onFollowersClick: () -> Unit = {},
+    onFollowingClick: () -> Unit = {},
+    onCloseFollowList: () -> Unit = {},
+    onUserClick: (UserEntity) -> Unit = {},
     onMessageClick: () -> Unit,
     onBlockClick: () -> Unit,
     onRestrictClick: () -> Unit,
@@ -209,8 +223,8 @@ fun ProfileScreen(
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 StatColumn(count = "${user.postCount}", label = "Posts")
-                StatColumn(count = "${user.followerCount}", label = "Followers")
-                StatColumn(count = "${user.followingCount}", label = "Following")
+                StatColumn(count = "${user.followerCount}", label = "Followers", onClick = onFollowersClick)
+                StatColumn(count = "${user.followingCount}", label = "Following", onClick = onFollowingClick)
             }
         }
 
@@ -258,6 +272,7 @@ fun ProfileScreen(
             } else {
                 Button(
                     onClick = onFollowClick,
+                    enabled = !isFollowLoading,
                     modifier = Modifier
                         .weight(1f)
                         .testTag("follow_user_button"),
@@ -275,14 +290,22 @@ fun ProfileScreen(
                         }
                     )
                 ) {
-                    Text(
-                        text = when (user.followStatus) {
-                            "following" -> "Following"
-                            "requested" -> "Requested"
-                            else -> "Follow"
-                        },
-                        fontWeight = FontWeight.Bold
-                    )
+                    if (isFollowLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = if (user.followStatus == "following") MaterialTheme.colorScheme.onSurface else Color.White
+                        )
+                    } else {
+                        Text(
+                            text = when (user.followStatus) {
+                                "following" -> "Following"
+                                "requested" -> "Requested"
+                                else -> "Follow"
+                            },
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
 
                 OutlinedButton(
@@ -392,11 +415,97 @@ fun ProfileScreen(
             }
         }
     }
+
+    if (activeListType != null) {
+        val title = if (activeListType == "followers") "Followers" else "Following"
+        val usersList = if (activeListType == "followers") followersList else followingList
+
+        AlertDialog(
+            onDismissRequest = onCloseFollowList,
+            confirmButton = {
+                TextButton(onClick = onCloseFollowList) {
+                    Text("Close", fontWeight = FontWeight.Bold)
+                }
+            },
+            title = {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                )
+            },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(320.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isLoadingFollowList) {
+                        CircularProgressIndicator(color = AuraPink)
+                    } else if (usersList.isNullOrEmpty()) {
+                        Text(
+                            text = if (activeListType == "followers") "No followers yet." else "Not following anyone yet.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(usersList) { item ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            onCloseFollowList()
+                                            onUserClick(item)
+                                        }
+                                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    AsyncImage(
+                                        model = item.avatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=500" },
+                                        contentDescription = item.username,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(44.dp)
+                                            .clip(CircleShape)
+                                            .border(1.dp, AuraPink, CircleShape)
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = item.username,
+                                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                        )
+                                        if (item.fullName.isNotBlank()) {
+                                            Text(
+                                                text = item.fullName,
+                                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    }
 }
 
 @Composable
-fun StatColumn(count: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+fun StatColumn(
+    count: String,
+    label: String,
+    onClick: (() -> Unit)? = null
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = if (onClick != null) Modifier.clickable { onClick() } else Modifier
+    ) {
         Text(
             text = count,
             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, fontSize = 16.sp)

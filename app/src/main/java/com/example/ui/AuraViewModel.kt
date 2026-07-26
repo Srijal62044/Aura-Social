@@ -277,22 +277,10 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
             _authState.value = AuthState.LOGIN
         }
 
-        // Periodic polling loop for active conversation messages and feeds
+        // User profile update periodic sync (every 30s)
         viewModelScope.launch {
             while (true) {
-                kotlinx.coroutines.delay(2500)
-                val activePeer = _selectedConversationId.value
-                val current = _currentUsername.value
-                if (!activePeer.isNullOrBlank() && current.isNotBlank() && _currentScreen.value == AuraScreen.CHAT_DETAIL) {
-                    repository.fetchMessages(current, activePeer)
-                }
-            }
-        }
-
-        // Periodic polling loop for profile and online status updates in realtime
-        viewModelScope.launch {
-            while (true) {
-                kotlinx.coroutines.delay(5000)
+                kotlinx.coroutines.delay(30000)
                 val current = _currentUsername.value
                 if (current.isNotBlank()) {
                     repository.fetchUsers(current)
@@ -300,6 +288,24 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     if (latestMe != null) {
                         _currentUser.value = latestMe
                     }
+                }
+            }
+        }
+
+        // LiveKit connection status collector
+        viewModelScope.launch {
+            liveKitManager.isConnected.collect { connected ->
+                if (connected && _callState.value.isActive) {
+                    _callState.value = _callState.value.copy(status = "connected")
+                    startDurationTimer()
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            liveKitManager.connectionError.collect { err ->
+                if (err != null && _callState.value.isActive) {
+                    _callState.value = _callState.value.copy(status = "failed", errorMessage = err)
                 }
             }
         }
@@ -583,55 +589,38 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
         messagePollingJob?.cancel()
         typingPollingJob?.cancel()
+        repository.stopMessageRealtime()
 
         viewModelScope.launch {
             if (current.isNotBlank()) {
+                val start = System.currentTimeMillis()
+                repository.fetchMessages(current, username)
+
                 val user1 = repository.getUserDirect(current)
                 val user2 = repository.getUserDirect(username)
                 val id1 = user1?.id?.takeIf { it.isNotBlank() } ?: repository.supabase.getCurrentUserAuthId()
                 val id2 = user2?.id?.takeIf { it.isNotBlank() } ?: repository.getUserDirect(username)?.id
 
                 if (!id1.isNullOrBlank() && !id2.isNullOrBlank()) {
-                    repository.supabase.getOrCreateDirectConversation(id1, id2)
+                    val (convId, _) = repository.supabase.getOrCreateDirectConversation(id1, id2)
+                    if (!convId.isNullOrBlank()) {
+                        repository.startMessageRealtime(convId, viewModelScope)
+                    }
                 }
 
                 repository.markMessagesAsRead(current, username)
-                repository.fetchMessages(current, username)
-                val newCounts = repository.getUnreadCounts(current)
-                _unreadCountsPerConversation.value = newCounts
+                val duration = System.currentTimeMillis() - start
+                Log.d("AURA_PERF", "[AURA_PERF] Chat $username opened in ${duration}ms")
             }
             _isConversationLoading.value = false
-        }
-
-        // Active conversation realtime message sync loop
-        messagePollingJob = viewModelScope.launch {
-            while (isActive && _selectedConversationId.value == username) {
-                delay(1200)
-                val curr = _currentUsername.value
-                if (curr.isNotBlank()) {
-                    repository.fetchMessages(curr, username)
-                    repository.markMessagesAsRead(curr, username)
-                }
-            }
-        }
-
-        // Active typing indicator listener loop
-        typingPollingJob = viewModelScope.launch {
-            while (isActive && _selectedConversationId.value == username) {
-                delay(1000)
-                val curr = _currentUsername.value
-                if (curr.isNotBlank()) {
-                    val activeTyping = repository.getTypingUsers(username, curr)
-                    _isPeerTyping.value = activeTyping.isNotEmpty()
-                    _typingPeerUsername.value = activeTyping.firstOrNull()
-                }
-            }
         }
     }
 
     fun closeChat() {
         messagePollingJob?.cancel()
         typingPollingJob?.cancel()
+        repository.stopMessageRealtime()
+
         val activePeer = _selectedConversationId.value
         val current = _currentUsername.value
         if (!activePeer.isNullOrBlank() && current.isNotBlank()) {
@@ -642,6 +631,18 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         _selectedConversationId.value = null
         _isPeerTyping.value = false
         _typingPeerUsername.value = null
+    }
+
+    fun loadOlderMessages() {
+        val activePeer = _selectedConversationId.value ?: return
+        val current = _currentUsername.value
+        val currentList = repository.getMessagesListDirect(activePeer)
+        val oldestMsg = currentList.firstOrNull()
+        if (current.isNotBlank() && oldestMsg != null && oldestMsg.timestamp.isNotBlank()) {
+            viewModelScope.launch {
+                repository.loadOlderMessages(current, activePeer, oldestMsg.timestamp)
+            }
+        }
     }
 
     fun onUserTyping() {
@@ -676,29 +677,38 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
         val sender = _currentUsername.value
         val user = currentUser.value
 
-        // Cancel typing status immediately on send
         typingDebounceJob?.cancel()
+
+        val tempId = -System.currentTimeMillis()
+        val tempMsg = MessageEntity(
+            id = tempId,
+            conversationId = recipient,
+            senderUsername = sender,
+            recipientUsername = recipient,
+            senderAvatar = user?.avatarUrl ?: "",
+            text = text.ifBlank { if (type == "image") "Photo 📸" else "Voice Note 🎤" },
+            mediaUrl = mediaUrl,
+            type = type,
+            isMine = true,
+            timestamp = "Just now"
+        )
+
+        repository.addOptimisticMessage(tempMsg)
+        onResult?.invoke(true, "")
+
         viewModelScope.launch {
+            val startTime = System.currentTimeMillis()
             repository.sendTypingStatus(recipient, sender, false)
-            val (success, errMsg) = repository.sendMessage(
-                MessageEntity(
-                    conversationId = recipient,
-                    senderUsername = sender,
-                    recipientUsername = recipient,
-                    senderAvatar = user?.avatarUrl ?: "",
-                    text = text,
-                    mediaUrl = mediaUrl,
-                    type = type,
-                    isMine = true,
-                    timestamp = "Just now"
-                )
-            )
+            val (success, errMsg, realMsg) = repository.sendMessageEx(tempMsg)
+            val duration = System.currentTimeMillis() - startTime
             if (success) {
-                repository.fetchMessages(sender, recipient)
-                onResult?.invoke(true, "")
+                Log.d("AURA_PERF", "[AURA_PERF] Send message completed in ${duration}ms")
+                if (realMsg != null) {
+                    repository.replaceOptimisticMessage(tempId, realMsg)
+                }
             } else {
-                showFeedback(errMsg)
-                onResult?.invoke(false, errMsg)
+                Log.e("AURA_PERF", "[AURA_PERF] Send message failed after ${duration}ms: $errMsg")
+                showFeedback("Failed to send: $errMsg")
             }
         }
     }
@@ -890,7 +900,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleCamera() {
         val newCam = !_callState.value.isCameraOn
         _callState.value = _callState.value.copy(isCameraOn = newCam)
-        liveKitManager.toggleCamera(!newCam)
+        liveKitManager.toggleCamera(newCam)
+    }
+
+    fun switchCamera() {
+        liveKitManager.switchCamera()
+    }
+
+    fun toggleSpeaker(context: android.content.Context) {
+        val currentSpeaker = liveKitManager.isSpeakerOn.value
+        liveKitManager.toggleSpeaker(context, !currentSpeaker)
     }
 
     // SEARCH

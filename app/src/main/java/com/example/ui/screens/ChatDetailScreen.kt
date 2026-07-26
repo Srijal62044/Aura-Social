@@ -97,6 +97,7 @@ fun ChatDetailScreen(
     onStartCall: (Boolean) -> Unit, // true: video call, false: voice call
     onSendMessage: (text: String, mediaUrl: String, type: String, onResult: ((Boolean, String) -> Unit)?) -> Unit,
     onTyping: () -> Unit = {},
+    onLoadOlderMessages: () -> Unit = {},
     onDeleteMessage: (Long) -> Unit
 ) {
     var messageText by remember { mutableStateOf("") }
@@ -128,6 +129,18 @@ fun ChatDetailScreen(
                 val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
                 lastVisible >= totalItems - 3
             }
+        }
+    }
+
+    val isAtTop by remember {
+        derivedStateOf {
+            listState.firstVisibleItemIndex == 0
+        }
+    }
+
+    LaunchedEffect(isAtTop) {
+        if (isAtTop && messages.size >= 30) {
+            onLoadOlderMessages()
         }
     }
 

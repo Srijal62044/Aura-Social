@@ -477,10 +477,89 @@ class AuraRepository(
         map[conversationId] ?: emptyList()
     }
 
+    fun getMessagesListDirect(conversationId: String): List<MessageEntity> {
+        return _messagesMap.value[conversationId] ?: emptyList()
+    }
+
+    fun addOptimisticMessage(message: MessageEntity) {
+        val convId = message.conversationId
+        val currentList = _messagesMap.value[convId] ?: emptyList()
+        _messagesMap.value = _messagesMap.value.toMutableMap().apply {
+            put(convId, currentList + message)
+        }
+        Log.d("AURA_PERF", "[AURA_PERF] Optimistic message added: tempId=${message.id} for $convId")
+    }
+
+    fun replaceOptimisticMessage(tempId: Long, realMessage: MessageEntity) {
+        val convId = realMessage.conversationId
+        val currentList = _messagesMap.value[convId] ?: emptyList()
+        val updated = currentList.map { msg ->
+            if (msg.id == tempId) realMessage else msg
+        }
+        _messagesMap.value = _messagesMap.value.toMutableMap().apply {
+            put(convId, updated)
+        }
+        Log.d("AURA_PERF", "[AURA_PERF] Replaced optimistic msg tempId=$tempId with realId=${realMessage.id}")
+    }
+
+    fun onRealtimeMessageReceived(realMessage: MessageEntity) {
+        val convId = realMessage.conversationId
+        val currentList = _messagesMap.value[convId] ?: emptyList()
+
+        // Deduplication: check if message ID already exists
+        if (currentList.any { it.id == realMessage.id && realMessage.id > 0 }) {
+            Log.d("AURA_PERF", "[AURA_PERF] Realtime msg id=${realMessage.id} already exists. Skipping duplicate.")
+            return
+        }
+
+        // Check if there is an optimistic message (tempId < 0) matching sender and text
+        val tempIndex = currentList.indexOfFirst {
+            it.id < 0 && it.senderUsername == realMessage.senderUsername && it.text == realMessage.text
+        }
+
+        if (tempIndex >= 0) {
+            val updatedList = currentList.toMutableList()
+            updatedList[tempIndex] = realMessage
+            _messagesMap.value = _messagesMap.value.toMutableMap().apply {
+                put(convId, updatedList)
+            }
+            Log.d("AURA_PERF", "[AURA_PERF] Realtime msg matched temp msg at index $tempIndex. Replaced.")
+        } else {
+            _messagesMap.value = _messagesMap.value.toMutableMap().apply {
+                put(convId, currentList + realMessage)
+            }
+            Log.d("AURA_PERF", "[AURA_PERF] Realtime msg id=${realMessage.id} appended to $convId")
+        }
+    }
+
     suspend fun fetchMessages(currentUsername: String, conversationId: String) {
         if (currentUsername.isBlank() || conversationId.isBlank()) return
-        val list = supabase.getMessagesForConversation(currentUsername, conversationId)
+        val list = supabase.getMessagesForConversation(currentUsername, conversationId, limit = 50)
         _messagesMap.value = _messagesMap.value.toMutableMap().apply { put(conversationId, list) }
+    }
+
+    suspend fun loadOlderMessages(currentUsername: String, conversationId: String, beforeTimestamp: String) {
+        if (currentUsername.isBlank() || conversationId.isBlank() || beforeTimestamp.isBlank()) return
+        val olderList = supabase.getMessagesForConversation(currentUsername, conversationId, limit = 30, beforeTimestamp = beforeTimestamp)
+        if (olderList.isNotEmpty()) {
+            val currentList = _messagesMap.value[conversationId] ?: emptyList()
+            val existingIds = currentList.map { it.id }.toSet()
+            val newOlder = olderList.filter { !existingIds.contains(it.id) }
+            _messagesMap.value = _messagesMap.value.toMutableMap().apply {
+                put(conversationId, newOlder + currentList)
+            }
+            Log.d("AURA_PERF", "[AURA_PERF] Loaded ${newOlder.size} older messages for $conversationId")
+        }
+    }
+
+    fun startMessageRealtime(conversationId: String, scope: CoroutineScope) {
+        supabase.startMessageRealtimeListener(conversationId, scope) { newMsg ->
+            onRealtimeMessageReceived(newMsg)
+        }
+    }
+
+    fun stopMessageRealtime() {
+        supabase.stopMessageRealtimeListener()
     }
 
     suspend fun sendMessage(message: MessageEntity, appContext: Context? = context): Pair<Boolean, String> {
@@ -493,19 +572,25 @@ class AuraRepository(
             mediaUrl = uploaded
         }
         val cleanMsg = message.copy(mediaUrl = mediaUrl)
-        val result = supabase.sendMessage(cleanMsg)
-        if (result.first) {
-            fetchMessages(message.senderUsername, message.conversationId)
+        return supabase.sendMessage(cleanMsg)
+    }
+
+    suspend fun sendMessageEx(message: MessageEntity, appContext: Context? = context): Triple<Boolean, String, MessageEntity?> {
+        var mediaUrl = message.mediaUrl
+        if (appContext != null && mediaUrl.isNotBlank() && (mediaUrl.startsWith("content://") || mediaUrl.startsWith("file://"))) {
+            val uploaded = supabase.uploadMedia(appContext, "chat-media", mediaUrl)
+            if (uploaded.isBlank()) {
+                return Triple(false, "Media upload failed. Message not sent.", null)
+            }
+            mediaUrl = uploaded
         }
-        return result
+        val cleanMsg = message.copy(mediaUrl = mediaUrl)
+        return supabase.sendMessageEx(cleanMsg)
     }
 
     suspend fun markMessagesAsRead(currentUsername: String, peerUsername: String) {
         if (currentUsername.isBlank() || peerUsername.isBlank()) return
-        val success = supabase.markMessagesAsRead(currentUsername, peerUsername)
-        if (success) {
-            fetchMessages(currentUsername, peerUsername)
-        }
+        supabase.markMessagesAsRead(currentUsername, peerUsername)
     }
 
     suspend fun getUnreadCounts(currentUsername: String): Map<String, Int> {

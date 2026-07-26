@@ -405,6 +405,7 @@ class MainActivity : ComponentActivity() {
                                                 viewModel.sendMessage(text, media, type, onResult)
                                             },
                                             onTyping = { viewModel.onUserTyping() },
+                                            onLoadOlderMessages = { viewModel.loadOlderMessages() },
                                             onDeleteMessage = { id -> viewModel.deleteMessage(id) }
                                         )
                                     }
@@ -495,7 +496,9 @@ class MainActivity : ComponentActivity() {
                                 onCancelCall = { viewModel.cancelCall() },
                                 onEndCall = { viewModel.endCall() },
                                 onToggleMute = { viewModel.toggleMute() },
-                                onToggleCamera = { viewModel.toggleCamera() }
+                                onToggleCamera = { viewModel.toggleCamera() },
+                                onSwitchCamera = { viewModel.switchCamera() },
+                                onToggleSpeaker = { viewModel.toggleSpeaker(this@MainActivity) }
                             )
                         }
                     }

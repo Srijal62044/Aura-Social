@@ -37,6 +37,18 @@ class SupabaseService {
     @Volatile
     var currentUserToken: String? = null
 
+    private val profileCacheByUsername = java.util.concurrent.ConcurrentHashMap<String, UserEntity>()
+    private val profileCacheByUuid = java.util.concurrent.ConcurrentHashMap<String, UserEntity>()
+
+    fun cacheProfile(profile: UserEntity) {
+        if (profile.username.isNotBlank()) {
+            profileCacheByUsername[profile.username.lowercase().trim()] = profile
+        }
+        if (profile.id.isNotBlank()) {
+            profileCacheByUuid[profile.id] = profile
+        }
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -571,8 +583,12 @@ class SupabaseService {
     }
 
     suspend fun getProfileByUsername(username: String): UserEntity? = withContext(Dispatchers.IO) {
+        val cleanName = username.lowercase().trim()
+        if (cleanName.isBlank()) return@withContext null
+        profileCacheByUsername[cleanName]?.let { return@withContext it }
+
         try {
-            val url = "$baseUrl/rest/v1/profiles?username=eq.${username.lowercase().trim()}&select=*"
+            val url = "$baseUrl/rest/v1/profiles?username=eq.$cleanName&select=*"
             val requestBuilder = Request.Builder().url(url).get()
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
@@ -589,6 +605,8 @@ class SupabaseService {
 
     suspend fun getProfileByUuid(uuid: String): UserEntity? = withContext(Dispatchers.IO) {
         if (uuid.isBlank()) return@withContext null
+        profileCacheByUuid[uuid]?.let { return@withContext it }
+
         try {
             val url = "$baseUrl/rest/v1/profiles?id=eq.$uuid&select=*"
             val requestBuilder = Request.Builder().url(url).get()
@@ -698,7 +716,7 @@ class SupabaseService {
     }
 
     private fun parseProfile(obj: JSONObject): UserEntity {
-        return UserEntity(
+        val user = UserEntity(
             id = obj.optString("id"),
             username = obj.optString("username"),
             fullName = obj.optString("full_name"),
@@ -716,6 +734,8 @@ class SupabaseService {
             isOnline = obj.optBoolean("is_online"),
             lastSeen = obj.optString("last_seen")
         )
+        cacheProfile(user)
+        return user
     }
 
     // --- FOLLOWS ---
@@ -1388,26 +1408,43 @@ class SupabaseService {
 
     // --- MESSAGES ---
 
-    suspend fun getMessagesForConversation(currentUsername: String, peerUsername: String): List<MessageEntity> = withContext(Dispatchers.IO) {
+    suspend fun getMessagesForConversation(
+        currentUsername: String,
+        peerUsername: String,
+        limit: Int = 50,
+        beforeTimestamp: String? = null
+    ): List<MessageEntity> = withContext(Dispatchers.IO) {
+        val startTime = System.currentTimeMillis()
         try {
             val cUser = currentUsername.lowercase().trim()
             val pUser = peerUsername.lowercase().trim()
             if (cUser.isBlank() || pUser.isBlank()) return@withContext emptyList()
 
-            val currentProfile = getProfileByUsername(cUser) ?: return@withContext emptyList()
-            val peerProfile = getProfileByUsername(pUser) ?: return@withContext emptyList()
-            val currentId = currentProfile.id
-            val peerId = peerProfile.id
-            if (currentId.isBlank() || peerId.isBlank()) return@withContext emptyList()
+            val currentProfile = getProfileByUsername(cUser)
+            val peerProfile = getProfileByUsername(pUser)
+            val currentId = currentProfile?.id.orEmpty()
+            val peerId = peerProfile?.id.orEmpty()
 
-            val sorted = listOf(currentId, peerId).sorted()
-            val convUuid = try {
-                java.util.UUID.nameUUIDFromBytes("conversation_${sorted[0]}_${sorted[1]}".toByteArray()).toString()
-            } catch (e: Exception) {
-                java.util.UUID.randomUUID().toString()
+            var convUuid: String? = null
+            if (currentId.isNotBlank() && peerId.isNotBlank()) {
+                val (foundId, _) = getOrCreateDirectConversation(currentId, peerId)
+                convUuid = foundId
             }
 
-            val url = "$baseUrl/rest/v1/messages?or=(conversation_uuid.eq.$convUuid,conversation_id.eq.$convUuid,and(sender_id.eq.$currentId,recipient_id.eq.$peerId),and(sender_id.eq.$peerId,recipient_id.eq.$currentId))&select=id,conversation_id,conversation_uuid,sender_username,recipient_username,sender_id,recipient_id,text,content,media_url,type,message_type,created_at&order=created_at.asc"
+            val url = if (!convUuid.isNullOrBlank()) {
+                var query = "$baseUrl/rest/v1/messages?conversation_id=eq.$convUuid"
+                if (!beforeTimestamp.isNullOrBlank()) {
+                    query += "&created_at=lt.$beforeTimestamp"
+                }
+                "$query&select=id,conversation_id,conversation_uuid,sender_username,recipient_username,sender_id,recipient_id,text,content,media_url,type,message_type,created_at&order=created_at.desc&limit=$limit"
+            } else {
+                var query = "$baseUrl/rest/v1/messages?or=(and(sender_id.eq.$currentId,recipient_id.eq.$peerId),and(sender_id.eq.$peerId,recipient_id.eq.$currentId))"
+                if (!beforeTimestamp.isNullOrBlank()) {
+                    query += "&created_at=lt.$beforeTimestamp"
+                }
+                "$query&select=id,conversation_id,conversation_uuid,sender_username,recipient_username,sender_id,recipient_id,text,content,media_url,type,message_type,created_at&order=created_at.desc&limit=$limit"
+            }
+
             val requestBuilder = Request.Builder().url(url).get()
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
@@ -1450,7 +1487,7 @@ class SupabaseService {
                             conversationId = pUser,
                             senderUsername = sender,
                             recipientUsername = recipient,
-                            senderAvatar = if (isCurrentSender) currentProfile.avatarUrl else peerProfile.avatarUrl,
+                            senderAvatar = if (isCurrentSender) currentProfile?.avatarUrl.orEmpty() else peerProfile?.avatarUrl.orEmpty(),
                             text = textVal,
                             mediaUrl = mediaUrlVal,
                             type = displayType,
@@ -1459,7 +1496,10 @@ class SupabaseService {
                         )
                     )
                 }
-                list
+                val sortedAsc = list.reversed()
+                val duration = System.currentTimeMillis() - startTime
+                Log.d("AURA_PERF", "[AURA_PERF] Fetched ${sortedAsc.size} messages in ${duration}ms for $pUser")
+                sortedAsc
             } else {
                 Log.e(TAG, "getMessagesForConversation failed code: ${response.code}, body: $respString")
                 emptyList()
@@ -1805,6 +1845,7 @@ class SupabaseService {
             val requestBuilder = Request.Builder()
                 .url(url)
                 .post(bodyJson.toString().toRequestBody("application/json".toMediaType()))
+                .addHeader("Prefer", "return=representation")
             getHeaders().forEach { (k, v) -> requestBuilder.addHeader(k, v) }
 
             val response = client.newCall(requestBuilder.build()).execute()
@@ -1812,8 +1853,40 @@ class SupabaseService {
             Log.d(TAG, "POST /rest/v1/messages response code: ${response.code}, body: $respStr")
 
             if (response.isSuccessful || response.code == 201) {
+                var insertedMsg: MessageEntity? = null
+                try {
+                    val array = JSONArray(respStr)
+                    if (array.length() > 0) {
+                        val obj = array.getJSONObject(0)
+                        val id = obj.optLong("id")
+                        val textCol = obj.optString("text")
+                        val contentCol = obj.optString("content")
+                        val mediaUrlCol = obj.optString("media_url")
+                        val displayContent = contentCol.ifBlank { textCol.ifBlank { mediaUrlCol } }
+                        val typeCol = obj.optString("type")
+                        val messageTypeCol = obj.optString("message_type")
+                        val displayType = messageTypeCol.ifBlank { typeCol.ifBlank { "text" } }
+                        val isMedia = displayType == "image" || displayType == "voice" || displayType == "audio"
+                        val textVal = if (displayType == "image") "Photo 📸" else if (displayType == "voice" || displayType == "audio") "Voice Note 🎤" else displayContent
+                        val mediaUrlVal = if (isMedia) displayContent.ifBlank { mediaUrlCol } else ""
+
+                        insertedMsg = MessageEntity(
+                            id = id,
+                            conversationId = recipientUsername,
+                            senderUsername = senderUsername,
+                            recipientUsername = recipientUsername,
+                            senderAvatar = senderProfile?.avatarUrl.orEmpty(),
+                            text = textVal,
+                            mediaUrl = mediaUrlVal,
+                            type = displayType,
+                            timestamp = formatTimestamp(obj.optString("created_at")),
+                            isMine = true
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to parse inserted message representation: ${e.message}")
+                }
                 Log.d("CONVERSATION_DEBUG", "MESSAGE_INSERT_SUCCESS: $respStr")
-                System.err.println("CONVERSATION_DEBUG: MESSAGE_INSERT_SUCCESS=$respStr")
                 Pair(true, "Message sent successfully")
             } else {
                 val errJson = try { JSONObject(respStr) } catch (e: Exception) { null }
@@ -1832,6 +1905,11 @@ class SupabaseService {
             System.err.println("CONVERSATION_DEBUG: $errStr")
             Pair(false, errStr)
         }
+    }
+
+    suspend fun sendMessageEx(message: MessageEntity): Triple<Boolean, String, MessageEntity?> = withContext(Dispatchers.IO) {
+        val (success, err) = sendMessage(message)
+        Triple(success, err, if (success) message else null)
     }
 
     suspend fun markMessagesAsRead(currentUsername: String, peerUsername: String): Boolean = withContext(Dispatchers.IO) {
@@ -2040,6 +2118,147 @@ class SupabaseService {
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    // --- REALTIME MESSAGES LISTENER ---
+
+    private var realtimeMessageWebSocket: okhttp3.WebSocket? = null
+    private var realtimeMessageHeartbeatJob: Job? = null
+    private var activeRealtimeConvId: String? = null
+
+    fun startMessageRealtimeListener(
+        conversationId: String,
+        coroutineScope: CoroutineScope,
+        onNewMessage: (MessageEntity) -> Unit
+    ) {
+        if (activeRealtimeConvId == conversationId && realtimeMessageWebSocket != null) {
+            Log.d(TAG, "[AURA_PERF] Realtime subscription already active for conversation $conversationId. Skipping.")
+            return
+        }
+        stopMessageRealtimeListener()
+        if (conversationId.isBlank()) return
+
+        activeRealtimeConvId = conversationId
+        val topicName = "realtime:public:messages:$conversationId"
+
+        try {
+            val host = baseUrl.removePrefix("https://").removePrefix("http://").removeSuffix("/")
+            val wsUrl = "wss://$host/realtime/v1/websocket?apikey=$apiKey&v=1.0.0"
+
+            val wsRequest = Request.Builder().url(wsUrl).build()
+            realtimeMessageWebSocket = client.newWebSocket(wsRequest, object : okhttp3.WebSocketListener() {
+                override fun onOpen(webSocket: okhttp3.WebSocket, response: okhttp3.Response) {
+                    Log.d(TAG, "[AURA_PERF] Realtime WebSocket connected for conversation_id: $conversationId")
+
+                    val joinPayload = JSONObject().apply {
+                        put("topic", topicName)
+                        put("event", "phx_join")
+                        put("payload", JSONObject().apply {
+                            put("config", JSONObject().apply {
+                                put("postgres_changes", JSONArray().apply {
+                                    put(JSONObject().apply {
+                                        put("event", "INSERT")
+                                        put("schema", "public")
+                                        put("table", "messages")
+                                        put("filter", "conversation_id=eq.$conversationId")
+                                    })
+                                })
+                            })
+                        })
+                        put("ref", "msg_1")
+                    }
+                    webSocket.send(joinPayload.toString())
+
+                    realtimeMessageHeartbeatJob?.cancel()
+                    realtimeMessageHeartbeatJob = coroutineScope.launch(Dispatchers.IO) {
+                        while (isActive) {
+                            delay(25000)
+                            val hb = JSONObject().apply {
+                                put("topic", "phoenix")
+                                put("event", "heartbeat")
+                                put("payload", JSONObject())
+                                put("ref", "msg_hb_${System.currentTimeMillis()}")
+                            }
+                            webSocket.send(hb.toString())
+                        }
+                    }
+                }
+
+                override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                    try {
+                        val json = JSONObject(text)
+                        val event = json.optString("event")
+                        if (event == "postgres_changes") {
+                            val payload = json.optJSONObject("payload")
+                            val data = payload?.optJSONObject("data")
+                            val record = data?.optJSONObject("record") ?: payload?.optJSONObject("record")
+                            if (record != null) {
+                                val msg = parseMessageRecord(record)
+                                if (msg != null) {
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        onNewMessage(msg)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[AURA_PERF] Realtime message parse error: ${e.message}")
+                    }
+                }
+
+                override fun onFailure(webSocket: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                    Log.e(TAG, "[AURA_PERF] Realtime message WebSocket failure: ${t.localizedMessage}")
+                }
+
+                override fun onClosing(webSocket: okhttp3.WebSocket, code: Int, reason: String) {
+                    Log.d(TAG, "[AURA_PERF] Realtime message WebSocket closing: $reason")
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "[AURA_PERF] Failed to start Realtime message WebSocket: ${e.localizedMessage}", e)
+        }
+    }
+
+    fun stopMessageRealtimeListener() {
+        realtimeMessageHeartbeatJob?.cancel()
+        realtimeMessageHeartbeatJob = null
+        realtimeMessageWebSocket?.close(1000, "Chat closed or conversation changed")
+        realtimeMessageWebSocket = null
+        activeRealtimeConvId = null
+        Log.d(TAG, "[AURA_PERF] Stopped Realtime message listener")
+    }
+
+    private fun parseMessageRecord(obj: JSONObject): MessageEntity? {
+        val id = obj.optLong("id")
+        val senderUser = obj.optString("sender_username")
+        val recipientUser = obj.optString("recipient_username")
+        val textCol = obj.optString("text")
+        val contentCol = obj.optString("content")
+        val mediaUrlCol = obj.optString("media_url")
+        val displayContent = contentCol.ifBlank { textCol.ifBlank { mediaUrlCol } }
+
+        val typeCol = obj.optString("type")
+        val messageTypeCol = obj.optString("message_type")
+        val displayType = messageTypeCol.ifBlank { typeCol.ifBlank { "text" } }
+
+        val isMedia = displayType == "image" || displayType == "voice" || displayType == "audio"
+        val textVal = if (displayType == "image") "Photo 📸" else if (displayType == "voice" || displayType == "audio") "Voice Note 🎤" else displayContent
+        val mediaUrlVal = if (isMedia) displayContent.ifBlank { mediaUrlCol } else ""
+
+        val isCurrentSender = obj.optString("sender_id") == currentAuthUserId
+
+        return MessageEntity(
+            id = id,
+            conversationId = if (isCurrentSender) recipientUser else senderUser,
+            senderUsername = senderUser,
+            recipientUsername = recipientUser,
+            senderAvatar = obj.optString("sender_avatar"),
+            text = textVal,
+            mediaUrl = mediaUrlVal,
+            type = displayType,
+            timestamp = formatTimestamp(obj.optString("created_at")),
+            isMine = isCurrentSender
+        )
     }
 
     // --- CALLS & LIVEKIT SIGNALING ---
@@ -2276,6 +2495,22 @@ class SupabaseService {
     }
 
     suspend fun fetchLiveKitToken(roomName: String, identity: String): String? = withContext(Dispatchers.IO) {
+        // Try local JWT token generation using LiveKit API Key & Secret if available
+        try {
+            val apiKey = BuildConfig.LIVEKIT_API_KEY
+            val apiSecret = BuildConfig.LIVEKIT_API_SECRET
+            if (apiKey.isNotBlank() && apiSecret.isNotBlank()) {
+                val token = generateLiveKitTokenLocally(roomName, identity, apiKey, apiSecret)
+                if (!token.isNullOrBlank()) {
+                    Log.d(TAG, "Generated LiveKit token locally for room: $roomName")
+                    return@withContext token
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Local token generation fallback: ${e.localizedMessage}")
+        }
+
+        // Fallback to Edge Function
         try {
             val url = "$baseUrl/functions/v1/get-livekit-token"
             val bodyJson = JSONObject().apply {
@@ -2299,6 +2534,57 @@ class SupabaseService {
             }
         } catch (e: Exception) {
             Log.e(TAG, "fetchLiveKitToken exception: ${e.localizedMessage}")
+            null
+        }
+    }
+
+    private fun generateLiveKitTokenLocally(roomName: String, identity: String, apiKey: String, apiSecret: String): String? {
+        return try {
+            val header = JSONObject().apply {
+                put("alg", "HS256")
+                put("typ", "JWT")
+            }
+
+            val nowSeconds = System.currentTimeMillis() / 1000
+            val expSeconds = nowSeconds + (24 * 3600) // 24h validity
+
+            val videoGrant = JSONObject().apply {
+                put("room", roomName)
+                put("roomJoin", true)
+                put("canPublish", true)
+                put("canSubscribe", true)
+                put("canPublishData", true)
+            }
+
+            val payload = JSONObject().apply {
+                put("iss", apiKey)
+                put("sub", identity)
+                put("nbf", nowSeconds - 5)
+                put("exp", expSeconds)
+                put("video", videoGrant)
+            }
+
+            fun base64UrlEncode(bytes: ByteArray): String {
+                return android.util.Base64.encodeToString(
+                    bytes,
+                    android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING
+                )
+            }
+
+            val encodedHeader = base64UrlEncode(header.toString().toByteArray(Charsets.UTF_8))
+            val encodedPayload = base64UrlEncode(payload.toString().toByteArray(Charsets.UTF_8))
+
+            val signingInput = "$encodedHeader.$encodedPayload"
+
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            val secretKey = javax.crypto.spec.SecretKeySpec(apiSecret.toByteArray(Charsets.UTF_8), "HmacSHA256")
+            mac.init(secretKey)
+            val signatureBytes = mac.doFinal(signingInput.toByteArray(Charsets.UTF_8))
+            val encodedSignature = base64UrlEncode(signatureBytes)
+
+            "$signingInput.$encodedSignature"
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating local LiveKit token: ${e.localizedMessage}")
             null
         }
     }

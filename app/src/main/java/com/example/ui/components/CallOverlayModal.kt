@@ -33,10 +33,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
+import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -45,7 +48,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -86,7 +88,9 @@ fun CallOverlayModal(
     onCancelCall: () -> Unit,
     onEndCall: () -> Unit,
     onToggleMute: () -> Unit,
-    onToggleCamera: () -> Unit
+    onToggleCamera: () -> Unit,
+    onSwitchCamera: () -> Unit = {},
+    onToggleSpeaker: () -> Unit = {}
 ) {
     if (!callState.isActive) return
 
@@ -116,7 +120,7 @@ fun CallOverlayModal(
     }
 
     val remoteVideoTrack by liveKitManager.remoteVideoTrack.collectAsState()
-    val isLiveKitConnected by liveKitManager.isConnected.collectAsState()
+    val isSpeakerOn by liveKitManager.isSpeakerOn.collectAsState()
 
     val minutes = callState.callDurationSeconds / 60
     val seconds = callState.callDurationSeconds % 60
@@ -303,7 +307,7 @@ fun CallOverlayModal(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .padding(bottom = 60.dp),
+                            .padding(bottom = 60.dp, start = 16.dp, end = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         if (callState.isIncoming && callState.status == "ringing") {
@@ -354,11 +358,27 @@ fun CallOverlayModal(
                                 horizontalArrangement = Arrangement.SpaceEvenly,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // Speaker Button
+                                IconButton(
+                                    onClick = onToggleSpeaker,
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(CircleShape)
+                                        .background(if (isSpeakerOn) AuraPink else Color.White.copy(alpha = 0.2f))
+                                        .testTag("call_speaker_button")
+                                ) {
+                                    Icon(
+                                        imageVector = if (isSpeakerOn) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                        contentDescription = "Speaker",
+                                        tint = Color.White
+                                    )
+                                }
+
                                 // Mute Button
                                 IconButton(
                                     onClick = onToggleMute,
                                     modifier = Modifier
-                                        .size(58.dp)
+                                        .size(52.dp)
                                         .clip(CircleShape)
                                         .background(if (callState.isMuted) AuraPink else Color.White.copy(alpha = 0.2f))
                                         .testTag("call_mute_button")
@@ -380,7 +400,7 @@ fun CallOverlayModal(
                                         }
                                     },
                                     modifier = Modifier
-                                        .size(72.dp)
+                                        .size(68.dp)
                                         .clip(CircleShape)
                                         .background(Color(0xFFEF4444))
                                         .testTag("call_end_button")
@@ -398,7 +418,7 @@ fun CallOverlayModal(
                                     IconButton(
                                         onClick = onToggleCamera,
                                         modifier = Modifier
-                                            .size(58.dp)
+                                            .size(52.dp)
                                             .clip(CircleShape)
                                             .background(if (!callState.isCameraOn) AuraPink else Color.White.copy(alpha = 0.2f))
                                             .testTag("call_camera_button")
@@ -406,6 +426,22 @@ fun CallOverlayModal(
                                         Icon(
                                             imageVector = if (callState.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff,
                                             contentDescription = "Camera",
+                                            tint = Color.White
+                                        )
+                                    }
+
+                                    // Switch Camera Button
+                                    IconButton(
+                                        onClick = onSwitchCamera,
+                                        modifier = Modifier
+                                            .size(52.dp)
+                                            .clip(CircleShape)
+                                            .background(Color.White.copy(alpha = 0.2f))
+                                            .testTag("call_switch_camera_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Cameraswitch,
+                                            contentDescription = "Switch Camera",
                                             tint = Color.White
                                         )
                                     }
